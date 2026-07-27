@@ -1,43 +1,47 @@
+[Français](README.md) | [English](README.en.md)
+
 # SYTOG
 
-> SYTOG is a portable distributed runtime for synchronized sessions, activities
-> and capabilities.
+> SYTOG est un runtime distribué portable pour des sessions, activités et
+> capacités synchronisées.
 
-This repository contains a deliberately small V0 proving two independent paths:
+Ce dépôt contient une V0 volontairement sobre qui démontre deux parcours
+indépendants :
 
-- a deterministic session core: validated commands → immutable events → reducer,
-  snapshot, journal, and replay;
-- a functional capability registry: inventory, declarations, local exposure
-  policy, current availability, observations, and explainable deterministic
-  matching.
+- un cœur de session déterministe : commandes validées → événements immuables →
+  reducer, snapshot, journal et replay ;
+- un registre de capacités fonctionnelles : inventaire, offres, politique
+  d’exposition locale, disponibilité courante, observations et matching
+  déterministe explicable.
 
-SYTOG is not FFF, a game engine, an AI engine, or a cluster manager. Friends Fun
-Factory is a product above SYTOG; GOTUS and PuzzleGuess integrate through
-polyglot adapters; Noema implements AI capabilities; Delibra defines cognitive
-workflows; Observatory/Probe owns empirical history.
+SYTOG n’est ni FFF, ni un moteur de jeu, ni un moteur d’IA, ni un gestionnaire de
+cluster. Friends Fun Factory est un produit construit au-dessus de SYTOG ; GOTUS
+et PuzzleGuess s’intègrent par des adaptateurs polyglottes ; Noema implémente les
+capacités IA ; Delibra définit les workflows cognitifs ; Observatory/Probe
+conserve l’historique empirique.
 
-## Repository
+## Dépôt
 
 ```text
 crates/
-  sytog-domain/        durable session types and reducer
-  sytog-protocol/      versioned boundary envelope
-  sytog-runtime/       pure decision, effects, replay, snapshot
-  sytog-demo-counter/  example activity outside the generic core
-  sytog-demo-vote/     second activity validating the extension seam
-  sytog-capabilities/  offers, policy, availability, matching
-  sytog-cli/           local demonstrations and file operations
-  sytog-wasm/          narrow serialized browser façade
-fixtures/              stable V0 protocol, log, job, and nodes
-docs/                  architecture, ADRs, guides, threat model, roadmap
+  sytog-domain/        types durables de session et reducer
+  sytog-protocol/      enveloppes de frontière versionnées
+  sytog-runtime/       décision pure, effets, replay et snapshots
+  sytog-demo-counter/  activité exemple hors du cœur générique
+  sytog-demo-vote/     seconde activité validant la frontière d’extension
+  sytog-capabilities/  offres, politiques, disponibilité et matching
+  sytog-cli/           démonstrations locales et opérations sur fichiers
+  sytog-wasm/          façade navigateur sérialisée et étroite
+fixtures/              contrats V0 stables : protocole, journaux, jobs et nœuds
+docs/                  architecture, ADR, guides, menace et roadmap
 ```
 
-No empty transport or storage crates are present. Those adapters should appear
-only when a real scenario needs them.
+Le dépôt ne contient aucune crate vide de transport ou de stockage. Ces
+adaptateurs seront ajoutés lorsqu’un scénario réel en aura besoin.
 
-## Develop
+## Développement
 
-Rust 1.85.1 is pinned.
+Rust 1.85.1 est épinglé.
 
 ```bash
 cargo fmt --all --check
@@ -55,9 +59,17 @@ cargo run -p sytog-cli -- replay fixtures/session/demo-event-log.json
 cargo run -p sytog-cli -- validate fixtures/protocol/envelope-v1.json
 ```
 
-## Status
+## État
 
-Implemented means local, deterministic, in-memory behavior. Networking,
-durability adapters, cryptographic identity, reconnection exchange, execution,
-Media Sync, and product UIs remain explicitly conceptual. See
+« Implémenté » signifie ici un comportement local, déterministe et en mémoire.
+Le réseau, les adaptateurs de persistance, l’identité cryptographique, la
+reconnexion, l’exécution distribuée, Media Sync et les interfaces produit
+restent explicitement conceptuels. Voir
 [`docs/implementation-status.md`](docs/implementation-status.md).
+
+## Documentation
+
+Le français est la langue par défaut. Toute nouvelle page doit proposer un
+équivalent anglais et un sélecteur de langue réciproque. Voir la
+[convention documentaire](docs/README.md).
+
