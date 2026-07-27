@@ -4,6 +4,7 @@ use clap::{Parser, Subcommand};
 use serde::Serialize;
 use sytog_capabilities::{JobRequirement, NodeOffer, rank, validate_nodes};
 use sytog_demo_counter::CounterActivity;
+use sytog_demo_vote::VoteActivity;
 use sytog_domain::{
     Command, CommandRequest, MessageId, ParticipantId, SessionCommand, SessionId, SessionState,
 };
@@ -46,6 +47,7 @@ enum TopLevel {
 enum Demo {
     Session,
     Capabilities,
+    Vote,
 }
 
 #[derive(Subcommand)]
@@ -91,6 +93,14 @@ struct SessionDemo {
     replay_matches: bool,
 }
 
+#[derive(Serialize)]
+struct ActivityDemo {
+    event_log: EventLogV0,
+    final_state: SessionState,
+    snapshot: SnapshotV0,
+    replay_matches: bool,
+}
+
 fn main() {
     if let Err(error) = run() {
         eprintln!("error: {error}");
@@ -113,6 +123,7 @@ fn run() -> Result<(), CliError> {
             validate_capability_inputs(&job, &nodes)?;
             print_value(&rank(&job, &nodes), cli.json)?;
         }
+        TopLevel::Demo { kind: Demo::Vote } => print_value(&vote_demo()?, cli.json)?,
         TopLevel::Replay { event_log } => {
             let log: EventLogV0 = read_json(&event_log)?;
             let state = replay_log(SessionState::uninitialized(log.session_id.clone()), &log)?;
@@ -210,6 +221,79 @@ fn session_demo() -> Result<SessionDemo, CliError> {
     Ok(SessionDemo {
         event_log,
         refused_command: refused.to_string(),
+        snapshot: SnapshotV0 {
+            family: PROTOCOL_FAMILY.to_owned(),
+            protocol_version: PROTOCOL_VERSION,
+            schema_version: SNAPSHOT_SCHEMA_VERSION,
+            session_id,
+            revision: state.revision,
+            state: state.clone(),
+        },
+        replay_matches: rebuilt == state,
+        final_state: state,
+    })
+}
+
+fn vote_demo() -> Result<ActivityDemo, CliError> {
+    let vote = VoteActivity;
+    let session_id = SessionId::from("vote-session");
+    let mut state = SessionState::uninitialized(session_id.clone());
+    let mut log = Vec::new();
+    let commands = [
+        (
+            "v1",
+            "alice",
+            session(SessionCommand::CreateSession {
+                display_name: "Alice".to_owned(),
+            }),
+        ),
+        (
+            "v2",
+            "bob",
+            session(SessionCommand::Join {
+                display_name: "Bob".to_owned(),
+            }),
+        ),
+        (
+            "v3",
+            "alice",
+            session(SessionCommand::StartActivity {
+                descriptor: VoteActivity::descriptor(),
+            }),
+        ),
+        (
+            "v4",
+            "alice",
+            Command::Activity(VoteActivity::open(&["tea", "coffee"])),
+        ),
+        (
+            "v5",
+            "bob",
+            Command::Activity(VoteActivity::submit("coffee")),
+        ),
+        (
+            "v6",
+            "alice",
+            Command::Activity(VoteActivity::submit("tea")),
+        ),
+        ("v7", "alice", Command::Activity(VoteActivity::close())),
+    ];
+    for (message, actor, command) in commands {
+        let request = request(message, actor, state.revision, command);
+        log.extend(execute(&mut state, &request, Some(&vote))?.events);
+    }
+
+    let event_log = EventLogV0 {
+        family: PROTOCOL_FAMILY.to_owned(),
+        protocol_version: PROTOCOL_VERSION,
+        schema_version: EVENT_LOG_SCHEMA_VERSION,
+        session_id: session_id.clone(),
+        base_revision: 0,
+        events: log,
+    };
+    let rebuilt = replay_log(SessionState::uninitialized(session_id.clone()), &event_log)?;
+    Ok(ActivityDemo {
+        event_log,
         snapshot: SnapshotV0 {
             family: PROTOCOL_FAMILY.to_owned(),
             protocol_version: PROTOCOL_VERSION,

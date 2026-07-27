@@ -5,6 +5,7 @@ members = [
     "crates/sytog-protocol",
     "crates/sytog-runtime",
     "crates/sytog-demo-counter",
+    "crates/sytog-demo-vote",
     "crates/sytog-capabilities",
     "crates/sytog-cli",
     "crates/sytog-wasm",

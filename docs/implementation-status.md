@@ -5,6 +5,7 @@
 - typed session, participant, lifecycle, authority, activity envelope, revision;
 - create/join/start/stop/route/transfer commands with structured refusals;
 - `demo.counter` isolated as an example `ActivityEngine`;
+- `demo.vote` added without changing domain/runtime, proving the extension seam;
 - immutable sequenced events, pure reducer, requested effects;
 - versioned snapshot/log, unique event ids, atomic apply, deterministic replay;
 - versioned V0 envelope validation and stable fixtures;

@@ -22,3 +22,9 @@ For the fixture French streaming `qwen3:4b` job:
 The matcher never turns `node-c` into a candidate because it is fast, and never
 calls `node-d` executable because it is declared.
 
+## Second activity boundary
+
+`demo.vote` starts through the same generic session command, opens with two
+options, accepts one choice per participant, restricts closing to its moderator,
+produces a tally, and replays exactly. Its addition changes neither
+`sytog-domain` nor `sytog-runtime`.

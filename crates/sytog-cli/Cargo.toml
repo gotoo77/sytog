@@ -16,6 +16,7 @@ serde_json.workspace = true
 sytog-capabilities = { path = "../sytog-capabilities" }
 sytog-domain = { path = "../sytog-domain" }
 sytog-demo-counter = { path = "../sytog-demo-counter" }
+sytog-demo-vote = { path = "../sytog-demo-vote" }
 sytog-protocol = { path = "../sytog-protocol" }
 sytog-runtime = { path = "../sytog-runtime" }
 thiserror.workspace = true

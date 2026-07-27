@@ -258,6 +258,7 @@ dependencies = [
  "serde_json",
  "sytog-capabilities",
  "sytog-demo-counter",
+ "sytog-demo-vote",
  "sytog-domain",
  "sytog-protocol",
  "sytog-runtime",
@@ -266,6 +267,16 @@ dependencies = [
 
 [[package]]
 name = "sytog-demo-counter"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sytog-domain",
+ "sytog-runtime",
+]
+
+[[package]]
+name = "sytog-demo-vote"
 version = "0.1.0"
 dependencies = [
  "serde",

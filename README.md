@@ -24,6 +24,7 @@ crates/
   sytog-protocol/      versioned boundary envelope
   sytog-runtime/       pure decision, effects, replay, snapshot
   sytog-demo-counter/  example activity outside the generic core
+  sytog-demo-vote/     second activity validating the extension seam
   sytog-capabilities/  offers, policy, availability, matching
   sytog-cli/           local demonstrations and file operations
   sytog-wasm/          narrow serialized browser façade
@@ -45,6 +46,7 @@ cargo test --workspace
 cargo build -p sytog-wasm --target wasm32-unknown-unknown
 cargo run -p sytog-cli -- demo session
 cargo run -p sytog-cli -- demo capabilities
+cargo run -p sytog-cli -- demo vote
 cargo run -p sytog-cli -- --json capability match \
   fixtures/capabilities/job.json fixtures/capabilities/nodes.json
 cargo run -p sytog-cli -- --json capability match \
