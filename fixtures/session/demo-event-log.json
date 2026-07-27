@@ -1,0 +1,81 @@
+{
+  "family": "sytog",
+  "protocol_version": 1,
+  "schema_version": 1,
+  "session_id": "demo-session",
+  "base_revision": 0,
+  "events": [
+    {
+      "event_id": "m1:0",
+      "sequence": 1,
+      "causation_id": "m1",
+      "actor": "alice",
+      "scope": "session",
+      "event": {
+        "type": "session_created",
+        "creator": "alice",
+        "display_name": "Alice"
+      }
+    },
+    {
+      "event_id": "m2:0",
+      "sequence": 2,
+      "causation_id": "m2",
+      "actor": "bob",
+      "scope": "session",
+      "event": {
+        "type": "participant_joined",
+        "participant": "bob",
+        "display_name": "Bob"
+      }
+    },
+    {
+      "event_id": "m4:0",
+      "sequence": 3,
+      "causation_id": "m4",
+      "actor": "alice",
+      "scope": "session",
+      "event": {
+        "type": "activity_started",
+        "descriptor": {
+          "activity_id": "demo.counter",
+          "version": "1.0.0"
+        },
+        "initial_state": {"counter": 0}
+      }
+    },
+    {
+      "event_id": "m5:0",
+      "sequence": 4,
+      "causation_id": "m5",
+      "actor": "bob",
+      "scope": "activity",
+      "event": {
+        "descriptor": {
+          "activity_id": "demo.counter",
+          "version": "1.0.0"
+        },
+        "activity_sequence": 1,
+        "event_type": "incremented",
+        "payload": {
+          "type": "incremented",
+          "participant": "bob",
+          "amount": 3
+        },
+        "resulting_state": {"counter": 3}
+      }
+    },
+    {
+      "event_id": "m6:0",
+      "sequence": 5,
+      "causation_id": "m6",
+      "actor": "alice",
+      "scope": "session",
+      "event": {
+        "type": "authority_transferred",
+        "from": "alice",
+        "to": "bob"
+      }
+    }
+  ]
+}

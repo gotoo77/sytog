@@ -1,0 +1,17 @@
+{
+  "capability": "llm.inference",
+  "requirement": {
+    "kind": "llm_inference",
+    "properties": {
+      "model": "qwen3:4b",
+      "minimum_context": 16000,
+      "language": "fr",
+      "streaming_required": true
+    }
+  },
+  "workload_profile": "qwen3:4b/default",
+  "local_network_only": true,
+  "requester_id": "alice",
+  "requester_network": "home-lan",
+  "estimated_memory_mib": 4096
+}

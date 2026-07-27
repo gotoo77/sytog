@@ -1,0 +1,14 @@
+{
+  "family": "sytog",
+  "version": 1,
+  "message_id": "m-001",
+  "session_id": "demo-session",
+  "sender_id": "alice",
+  "message_type": "command",
+  "revision": 0,
+  "payload": {
+    "type": "create_session",
+    "display_name": "Alice"
+  }
+}
+

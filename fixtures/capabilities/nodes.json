@@ -1,0 +1,202 @@
+[
+  {
+    "node_id": "node-a",
+    "network": "home-lan",
+    "inventory": {
+      "architecture": "x86_64",
+      "logical_cores": 16,
+      "total_memory_mib": 32768,
+      "accelerator": "NVIDIA RTX 4070"
+    },
+    "capabilities": [
+      {
+        "id": "node-a-noema-qwen",
+        "name": "llm.inference",
+        "implementation": "noema",
+        "contract": {
+          "kind": "llm_inference",
+          "properties": {
+            "models": ["qwen3:4b"],
+            "context_limit": 32768,
+            "languages": ["en", "fr"],
+            "supports_streaming": true
+          }
+        },
+        "concurrency": 1
+      },
+      {
+        "id": "node-a-cpu",
+        "name": "compute.cpu",
+        "implementation": "native-worker",
+        "contract": {
+          "kind": "cpu_compute",
+          "properties": {
+            "architectures": ["x86_64"],
+            "logical_cores": 12,
+            "supports_wasm": true
+          }
+        },
+        "concurrency": 2
+      }
+    ],
+    "policy": {
+      "allowed_capabilities": ["compute.cpu", "llm.inference"],
+      "allowed_requesters": [],
+      "local_network_only": true,
+      "manual_consent_required": false,
+      "consent_granted": false,
+      "max_memory_mib": 8192
+    },
+    "availability": {
+      "online": true,
+      "active_jobs": {},
+      "available_memory_mib": 12000
+    },
+    "observations": [
+      {
+        "capability_offer_id": "node-a-noema-qwen",
+        "workload_profile": "qwen3:4b/default",
+        "successful": true,
+        "latency_ms": 420,
+        "throughput": {"kind": "tokens_per_second", "value": 31.2}
+      },
+      {
+        "capability_offer_id": "node-a-cpu",
+        "workload_profile": "wasm/small",
+        "successful": true,
+        "latency_ms": 35,
+        "throughput": {"kind": "tasks_per_second", "value": 12.0}
+      }
+    ]
+  },
+  {
+    "node_id": "node-b",
+    "network": "home-lan",
+    "inventory": {
+      "architecture": "aarch64",
+      "logical_cores": 10,
+      "total_memory_mib": 16384,
+      "accelerator": null
+    },
+    "capabilities": [{
+      "id": "node-b-noema-gemma",
+      "name": "llm.inference",
+      "implementation": "noema",
+      "contract": {
+        "kind": "llm_inference",
+        "properties": {
+          "models": ["gemma3:4b"],
+          "context_limit": 32768,
+          "languages": ["en", "fr"],
+          "supports_streaming": true
+        }
+      },
+      "concurrency": 1
+    }],
+    "policy": {
+      "allowed_capabilities": ["llm.inference"],
+      "allowed_requesters": [],
+      "local_network_only": true,
+      "manual_consent_required": false,
+      "consent_granted": false,
+      "max_memory_mib": 8192
+    },
+    "availability": {
+      "online": true,
+      "active_jobs": {},
+      "available_memory_mib": 9000
+    },
+    "observations": []
+  },
+  {
+    "node_id": "node-c",
+    "network": "remote-site",
+    "inventory": {
+      "architecture": "x86_64",
+      "logical_cores": 32,
+      "total_memory_mib": 65536,
+      "accelerator": "AMD MI210"
+    },
+    "capabilities": [{
+      "id": "node-c-noema-qwen",
+      "name": "llm.inference",
+      "implementation": "noema",
+      "contract": {
+        "kind": "llm_inference",
+        "properties": {
+          "models": ["qwen3:4b"],
+          "context_limit": 65536,
+          "languages": ["en", "fr"],
+          "supports_streaming": true
+        }
+      },
+      "concurrency": 2
+    }],
+    "policy": {
+      "allowed_capabilities": ["llm.inference"],
+      "allowed_requesters": [],
+      "local_network_only": true,
+      "manual_consent_required": false,
+      "consent_granted": false,
+      "max_memory_mib": 16384
+    },
+    "availability": {
+      "online": true,
+      "active_jobs": {},
+      "available_memory_mib": 24000
+    },
+    "observations": [{
+      "capability_offer_id": "node-c-noema-qwen",
+      "workload_profile": "qwen3:4b/default",
+      "successful": true,
+      "latency_ms": 190,
+      "throughput": {"kind": "tokens_per_second", "value": 75.0}
+    }]
+  },
+  {
+    "node_id": "node-d",
+    "network": "home-lan",
+    "inventory": {
+      "architecture": "x86_64",
+      "logical_cores": 12,
+      "total_memory_mib": 32768,
+      "accelerator": "NVIDIA RTX 3060"
+    },
+    "capabilities": [{
+      "id": "node-d-noema-qwen",
+      "name": "llm.inference",
+      "implementation": "noema",
+      "contract": {
+        "kind": "llm_inference",
+        "properties": {
+          "models": ["qwen3:4b"],
+          "context_limit": 32768,
+          "languages": ["en", "fr"],
+          "supports_streaming": true
+        }
+      },
+      "concurrency": 1
+    }],
+    "policy": {
+      "allowed_capabilities": ["llm.inference"],
+      "allowed_requesters": [],
+      "local_network_only": true,
+      "manual_consent_required": false,
+      "consent_granted": false,
+      "max_memory_mib": 8192
+    },
+    "availability": {
+      "online": true,
+      "active_jobs": {"node-d-noema-qwen": 1},
+      "available_memory_mib": 6000
+    },
+    "observations": [{
+      "capability_offer_id": "node-d-noema-qwen",
+      "workload_profile": "qwen3:4b/default",
+      "successful": true,
+      "latency_ms": 680,
+      "throughput": {"kind": "tokens_per_second", "value": 18.0}
+    }]
+  }
+]
+

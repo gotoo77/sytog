@@ -1,0 +1,25 @@
+{
+  "family": "sytog",
+  "protocol_version": 1,
+  "schema_version": 1,
+  "session_id": "demo-session",
+  "revision": 5,
+  "state": {
+    "session_id": "demo-session",
+    "lifecycle": "active",
+    "participants": {
+      "alice": {"id": "alice", "display_name": "Alice"},
+      "bob": {"id": "bob", "display_name": "Bob"}
+    },
+    "authority": "bob",
+    "activity": {
+      "descriptor": {
+        "activity_id": "demo.counter",
+        "version": "1.0.0"
+      },
+      "revision": 1,
+      "state": {"counter": 3}
+    },
+    "revision": 5
+  }
+}

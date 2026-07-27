@@ -1,0 +1,19 @@
+[package]
+name = "sytog-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+sytog-domain = { path = "../sytog-domain" }
+sytog-protocol = { path = "../sytog-protocol" }
+thiserror.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[lints]
+workspace = true

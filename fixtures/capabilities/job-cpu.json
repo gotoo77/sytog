@@ -1,0 +1,16 @@
+{
+  "capability": "compute.cpu",
+  "requirement": {
+    "kind": "cpu_compute",
+    "properties": {
+      "architecture": "x86_64",
+      "minimum_logical_cores": 4,
+      "wasm_required": true
+    }
+  },
+  "workload_profile": "wasm/small",
+  "local_network_only": true,
+  "requester_id": "alice",
+  "requester_network": "home-lan",
+  "estimated_memory_mib": 512
+}
