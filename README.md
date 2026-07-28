@@ -29,6 +29,8 @@ crates/
   sytog-runtime/       décision pure, effets, replay et snapshots
   sytog-demo-counter/  activité exemple hors du cœur générique
   sytog-demo-vote/     seconde activité validant la frontière d’extension
+  sytog-transport/     messages réseau et adaptateur WebSocket
+  sytog-node/          hôte autoritaire et journal JSONL
   sytog-capabilities/  offres, politiques, disponibilité et matching
   sytog-cli/           démonstrations locales et opérations sur fichiers
   sytog-wasm/          façade navigateur sérialisée et étroite
@@ -59,12 +61,32 @@ cargo run -p sytog-cli -- replay fixtures/session/demo-event-log.json
 cargo run -p sytog-cli -- validate fixtures/protocol/envelope-v1.json
 ```
 
+### Session réseau locale
+
+Dans un premier terminal :
+
+```bash
+cargo build -p sytog-cli
+./target/debug/sytog serve --bind 127.0.0.1:7878
+```
+
+Puis dans deux autres terminaux :
+
+```bash
+./target/debug/sytog connect ws://127.0.0.1:7878 --participant alice
+./target/debug/sytog connect ws://127.0.0.1:7878 --participant bob
+```
+
+Commandes interactives : `open thé café`, `vote café`, `close`, `state`, `quit`.
+Chaque client conserve son état local sous `data/clients/` et demande les
+événements manquants lors d’une reconnexion.
+
 ## État
 
-« Implémenté » signifie ici un comportement local, déterministe et en mémoire.
-Le réseau, les adaptateurs de persistance, l’identité cryptographique, la
-reconnexion, l’exécution distribuée, Media Sync et les interfaces produit
-restent explicitement conceptuels. Voir
+La V0.2 ajoute un hôte WebSocket à autorité unique, un journal JSONL durable et
+le rattrapage à la reconnexion au cœur déterministe V0.1. L’identité
+cryptographique, le multi-autorité, l’exécution distante, Media Sync et les
+interfaces produit restent conceptuels. Voir
 [`docs/implementation-status.md`](docs/implementation-status.md).
 
 ## Documentation
@@ -72,4 +94,3 @@ restent explicitement conceptuels. Voir
 Le français est la langue par défaut. Toute nouvelle page doit proposer un
 équivalent anglais et un sélecteur de langue réciproque. Voir la
 [convention documentaire](docs/README.md).
-

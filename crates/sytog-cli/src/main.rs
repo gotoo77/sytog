@@ -1,4 +1,4 @@
-use std::{fs, path::PathBuf};
+use std::{fs, path::PathBuf, sync::Arc};
 
 use clap::{Parser, Subcommand};
 use serde::Serialize;
@@ -8,6 +8,7 @@ use sytog_demo_vote::VoteActivity;
 use sytog_domain::{
     Command, CommandRequest, MessageId, ParticipantId, SessionCommand, SessionId, SessionState,
 };
+use sytog_node::{ClientConfig, ServerConfig};
 use sytog_protocol::{
     EVENT_LOG_SCHEMA_VERSION, Envelope, EventLogV0, PROTOCOL_FAMILY, PROTOCOL_VERSION,
     SNAPSHOT_SCHEMA_VERSION, SnapshotV0,
@@ -27,6 +28,25 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum TopLevel {
+    /// Run the authoritative local WebSocket host.
+    Serve {
+        #[arg(long, default_value = "127.0.0.1:7878")]
+        bind: String,
+        #[arg(long, default_value = "data")]
+        data_dir: PathBuf,
+        #[arg(long, default_value = "demo-vote")]
+        session: String,
+    },
+    /// Connect an interactive participant to a local WebSocket host.
+    Connect {
+        url: String,
+        #[arg(long)]
+        participant: String,
+        #[arg(long, default_value = "demo-vote")]
+        session: String,
+        #[arg(long, default_value = "data/clients")]
+        data_dir: PathBuf,
+    },
     /// Run a built-in deterministic demonstration.
     Demo {
         #[command(subcommand)]
@@ -73,6 +93,8 @@ enum CliError {
     #[error(transparent)]
     Runtime(#[from] sytog_runtime::RuntimeError),
     #[error(transparent)]
+    Node(#[from] sytog_node::NodeError),
+    #[error(transparent)]
     Replay(#[from] sytog_runtime::ReplayError),
     #[error(transparent)]
     Protocol(#[from] sytog_protocol::ProtocolError),
@@ -101,16 +123,49 @@ struct ActivityDemo {
     replay_matches: bool,
 }
 
-fn main() {
-    if let Err(error) = run() {
+#[tokio::main]
+async fn main() {
+    if let Err(error) = run().await {
         eprintln!("error: {error}");
         std::process::exit(1);
     }
 }
 
-fn run() -> Result<(), CliError> {
+async fn run() -> Result<(), CliError> {
     let cli = Cli::parse();
     match cli.command {
+        TopLevel::Serve {
+            bind,
+            data_dir,
+            session,
+        } => {
+            sytog_node::serve(
+                ServerConfig {
+                    bind,
+                    data_dir,
+                    session_id: SessionId(session),
+                },
+                Arc::new(VoteActivity),
+            )
+            .await?;
+        }
+        TopLevel::Connect {
+            url,
+            participant,
+            session,
+            data_dir,
+        } => {
+            sytog_node::connect_client(
+                ClientConfig {
+                    url,
+                    data_dir,
+                    session_id: SessionId(session),
+                    participant_id: ParticipantId(participant),
+                },
+                parse_vote_network_command,
+            )
+            .await?;
+        }
         TopLevel::Demo {
             kind: Demo::Session,
         } => print_value(&session_demo()?, cli.json)?,
@@ -144,6 +199,19 @@ fn run() -> Result<(), CliError> {
         }
     }
     Ok(())
+}
+
+fn parse_vote_network_command(line: &str) -> Result<sytog_domain::ActivityCommandEnvelope, String> {
+    let words: Vec<_> = line.split_whitespace().collect();
+    match words.as_slice() {
+        ["open", options @ ..] if options.len() >= 2 => Ok(VoteActivity::open(options)),
+        ["vote", choice] => Ok(VoteActivity::submit(choice)),
+        ["close"] => Ok(VoteActivity::close()),
+        _ => Err(
+            "invalid command; use open <option...>, vote <choice>, close, state, or quit"
+                .to_owned(),
+        ),
+    }
 }
 
 fn session_demo() -> Result<SessionDemo, CliError> {

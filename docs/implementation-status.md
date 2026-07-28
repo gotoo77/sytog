@@ -1,34 +1,39 @@
-# Implementation status
+[Français](implementation-status.md) | [English](implementation-status.en.md)
 
-## Implemented and executable
+# État de l’implémentation
 
-- typed session, participant, lifecycle, authority, activity envelope, revision;
-- create/join/start/stop/route/transfer commands with structured refusals;
-- `demo.counter` isolated as an example `ActivityEngine`;
-- `demo.vote` added without changing domain/runtime, proving the extension seam;
-- immutable sequenced events, pure reducer, requested effects;
-- versioned snapshot/log, unique event ids, atomic apply, deterministic replay;
-- versioned V0 envelope validation and stable fixtures;
-- typed LLM and CPU contracts over a generic concrete offer;
-- separate inventory, offer, policy, availability, and offer-scoped observations;
-- hard, explainable per-offer matching and versioned deterministic score;
-- CLI demos, replay, validation, matching, and JSON output;
-- narrow Wasm capability-matching function;
-- CI workflow for format, Clippy, tests, and Wasm compilation;
-- unit/invariant tests for rejection immutability, replay, sequence, policy,
-  saturation, protocol version, and deterministic ranking.
+## Implémenté et exécutable
 
-## Designed but not implemented
+- session, participants, cycle de vie, autorité, enveloppes d’activité et
+  révision typés ;
+- commandes de création, jonction, activité et transfert avec refus structurés ;
+- `demo.counter` et `demo.vote` isolés derrière `ActivityEngine` ;
+- événements immuables et séquencés, réduction pure, application atomique et
+  replay déterministe ;
+- snapshots, journaux et enveloppes de protocole versionnés ;
+- contrats LLM et CPU, inventaire, politiques, disponibilité, observations par
+  offre et score de matching explicable ;
+- hôte WebSocket à autorité unique et clients multi-processus ;
+- diffusion des événements acceptés et rattrapage depuis une séquence connue ;
+- journal canonique JSON Lines synchronisé avant commit mémoire et diffusion ;
+- reconstruction de l’hôte depuis le journal après redémarrage ;
+- façade CLI pour les démonstrations, la validation, le replay, le matching,
+  `serve` et `connect` ;
+- façade Wasm étroite pour le matching ;
+- CI pour le formatage, Clippy, les tests et la compilation Wasm.
 
-- durable storage and transport adapters;
-- message deduplication and reconnect exchange;
-- real multi-client simulation and authority-failure recovery;
-- cryptographic identity, signatures, trust, and private projections;
-- job reservation/execution/cancellation and resource enforcement;
-- Observatory persistence and provenance;
-- Noema, Delibra, FFF, game, Media Sync, and TypeScript implementations;
-- generated Wasm/TypeScript package.
+## Conçu mais non implémenté
 
-The V0 matcher trusts supplied locality, declarations, policy, availability, and
-observations. It demonstrates the model; it is not safe authorization for real
-resource execution.
+- déduplication durable des commandes et reprise automatique d’une dernière
+  ligne JSONL partiellement écrite ;
+- snapshots réseau et compaction du journal ;
+- TLS applicatif, identité cryptographique, signatures et projections privées ;
+- découverte LAN, WebRTC, NAT traversal, consensus et multi-autorité ;
+- réservation, exécution et annulation distantes des jobs ;
+- persistance et provenance de l’Observatory ;
+- Noema, Delibra, FFF, jeux, Media Sync et implémentations TypeScript ;
+- paquet Wasm/TypeScript généré.
+
+Le matcher V0 fait confiance aux déclarations, politiques, disponibilités et
+observations fournies. Il démontre le modèle mais ne constitue pas une
+autorisation sûre pour l’exécution réelle de ressources.
