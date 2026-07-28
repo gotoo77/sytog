@@ -1270,6 +1270,8 @@ mod tests {
     use sytog_domain::{ActiveActivity, ActivityDescriptor, EventId, EventKind, SessionEventKind};
     use sytog_runtime::{ActivityRejection, ActivityTransition};
 
+    const ASYNC_TEST_TIMEOUT: Duration = Duration::from_secs(10);
+
     fn temporary_directory(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("sytog-{name}-{}", std::process::id()))
     }
@@ -1574,22 +1576,26 @@ mod tests {
         )
         .await;
 
-        while let Some(incoming) = receive(&mut socket).await.expect("host response is valid") {
-            match decode(&incoming).expect("host message decodes") {
-                NetworkMessage::EventBatch { events, .. }
-                    if events
-                        .iter()
-                        .any(|event| event.causation_id == request.message_id) =>
-                {
-                    return Ok(events);
+        tokio::time::timeout(ASYNC_TEST_TIMEOUT, async {
+            while let Some(incoming) = receive(&mut socket).await.expect("host response is valid") {
+                match decode(&incoming).expect("host message decodes") {
+                    NetworkMessage::EventBatch { events, .. }
+                        if events
+                            .iter()
+                            .any(|event| event.causation_id == request.message_id) =>
+                    {
+                        return Ok(events);
+                    }
+                    NetworkMessage::CommandRejected {
+                        message_id, code, ..
+                    } if message_id == request.message_id => return Err(code),
+                    _ => {}
                 }
-                NetworkMessage::CommandRejected {
-                    message_id, code, ..
-                } if message_id == request.message_id => return Err(code),
-                _ => {}
             }
-        }
-        panic!("connection closed without a command outcome");
+            panic!("connection closed without a command outcome");
+        })
+        .await
+        .expect("host returns a command outcome before the test timeout")
     }
 
     async fn catch_up_connection(
@@ -2224,9 +2230,13 @@ mod tests {
 
         let slow_host = Arc::clone(&host);
         let slow_task = tokio::spawn(async move { slow_host.submit(slow).await });
-        while !entered.load(Ordering::Acquire) {
-            tokio::task::yield_now().await;
-        }
+        tokio::time::timeout(ASYNC_TEST_TIMEOUT, async {
+            while !entered.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("slow decision starts before the test timeout");
         let fast_host = Arc::clone(&host);
         let fast_task = tokio::spawn(async move { fast_host.submit(fast).await });
         let slow_result = slow_task
@@ -2363,9 +2373,13 @@ mod tests {
             },
         )
         .await;
-        while !entered.load(Ordering::Acquire) {
-            tokio::task::yield_now().await;
-        }
+        tokio::time::timeout(ASYNC_TEST_TIMEOUT, async {
+            while !entered.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("slow decision starts before the test timeout");
         socket.close(None).await.expect("client disconnects");
         assert_eq!(host.current_revision().await, revision + 1);
         assert!(
