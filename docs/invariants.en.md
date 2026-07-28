@@ -573,6 +573,38 @@ blocks its connection task, but does not explicitly block the canonical
 producer. No memory, connection, batch-size, write-time, or service bound is
 guaranteed.
 
+**Proposed contract, partially typed but not enforced.** The protocol slice of
+[ADR 0008](adr/0008-overload-and-backpressure-contract.md) defines distinct V2
+envelopes, `ResyncRequired`, stable reasons, pre-admission rejection, and
+validated paged catch-up metadata. The node still emits and handles V1, so none
+of the runtime limits below is active yet. The ADR separates four pressure
+domains:
+
+- bounded global authoritative admission, with `server_overloaded` rejection
+  before any canonical fact, but no waiting for consumers after admission;
+- one per-connection output queue bounded by item count **and** bytes, drained
+  by a dedicated writer with a timeout;
+- queue or write-time limit converted into `ResyncRequired`, then explicit
+  close; every close requires reconnect from the highest contiguous sequence
+  the client applied and persisted;
+- paged catch-up bounded by events, bytes, duration, and concurrency, without
+  invisible interleaving with live delivery;
+- separate durable canonical archive, hot catch-up window, and snapshots; no
+  destructive compaction before snapshot-plus-suffix replay is validated;
+- explicit full resync when a cursor predates retained data.
+
+This contract does not promise end-to-end delivery. It promises that no lost
+notification or recovery transition is presented as continuous delivery: the
+recovery cursor belongs to the client and represents only contiguous applied
+facts it persisted locally.
+
+**Reclassification criterion.** INV-012 remains `Refuted / limited` until
+connection, admission, queue, byte, write, and catch-up bounds are implemented
+and tested. It remains at least `Limited` while the complete journal,
+accepted-command index, or canonical state can grow without a bound. Finite
+local retention, arbitrary historical catch-up, and no external archive cannot
+all be guaranteed simultaneously.
+
 **Existing tests.**
 
 - `persisted_old_replica_catches_up_large_suffix_after_host_restart` observes
@@ -601,5 +633,5 @@ batches.
    unbounded; INV-012 remains refuted / limited.
 
 All five breaking experiments are now characterized. The next step is no
-longer exploratory measurement: it requires choosing an explicit overload
-contract before changing production code.
+longer exploratory measurement: it requires human validation of ADR 0008's
+limits and protocol choices before changing production code.
