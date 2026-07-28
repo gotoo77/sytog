@@ -1,11 +1,16 @@
-# ADR 0002: Pure Rust core and serialized web boundary
+Langue canonique : Français
 
-Status: accepted
+English version: [English](0002-pure-rust-core-and-web-boundary.en.md)
 
-Durable rules use Rust without I/O, async runtime, global clock, or implicit
-randomness. TypeScript owns browser UI and platform APIs. Wasm exposes a narrow
-serialized façade rather than internal Rust layouts.
+[Français](0002-pure-rust-core-and-web-boundary.md) | [English](0002-pure-rust-core-and-web-boundary.en.md)
 
-Inputs that can vary must be supplied explicitly, which keeps replay and native
-or browser behavior aligned.
+# ADR 0002 : Cœur Rust pur et frontière web sérialisée
 
+Statut : accepté
+
+Les règles durables utilisent Rust sans I/O, runtime asynchrone, horloge globale ni aléa implicite.
+TypeScript porte l’interface navigateur et les API de plateforme.
+Wasm expose une façade sérialisée étroite plutôt que les représentations internes de Rust.
+
+Les entrées susceptibles de varier doivent être fournies explicitement, ce qui
+maintient l’alignement du replay et des comportements natif et navigateur.

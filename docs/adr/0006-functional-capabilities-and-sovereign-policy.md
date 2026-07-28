@@ -1,11 +1,19 @@
-# ADR 0006: Functional capabilities and sovereign exposure policy
+Langue canonique : Français
 
-Status: accepted
+English version: [English](0006-functional-capabilities-and-sovereign-policy.en.md)
 
-Hardware inventory, declared capability, exposure policy, current availability,
-and observed performance are different claims. Jobs express functional needs.
-Policy is a hard local gate; observations may rank only candidates already
-allowed, compatible, and available.
+[Français](0006-functional-capabilities-and-sovereign-policy.md) | [English](0006-functional-capabilities-and-sovereign-policy.en.md)
 
-This keeps consent sovereign and makes every rejection explainable.
+# ADR 0006 : Capacités fonctionnelles et politique souveraine d’exposition
 
+Statut : accepté
+
+L’inventaire matériel, la capacité déclarée, la politique d’exposition, la
+disponibilité courante et les performances observées sont des affirmations
+distinctes.
+Les jobs expriment des besoins fonctionnels.
+La politique est une barrière locale stricte ; les observations ne peuvent classer que les candidats
+déjà autorisés, compatibles et disponibles.
+
+Cette séparation préserve la souveraineté du consentement et rend chaque rejet
+explicable.

@@ -38,6 +38,12 @@ fixtures/              contrats V0 stables : protocole, journaux, jobs et nœuds
 docs/                  architecture, ADR, guides, menace et roadmap
 ```
 
+### Carte des crates
+
+![Architecture des crates SYTOG](docs/assets/sytog-crates-overview.png)
+
+_Les flèches indiquent les dépendances entre les crates._
+
 Le dépôt ne contient aucune crate vide de transport ou de stockage. Ces
 adaptateurs seront ajoutés lorsqu’un scénario réel en aura besoin.
 

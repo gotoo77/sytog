@@ -1,11 +1,18 @@
-# ADR 0004: Versioned protocol and polyglot activities
+Langue canonique : Français
 
-Status: accepted
+English version: [English](0004-versioned-protocol-and-polyglot-activities.en.md)
 
-All boundary messages carry protocol family and version. Unknown versions fail
-explicitly. JSON is the V0 boundary format and fixtures are compatibility
-contracts; internal Rust types are not designed around arbitrary JSON.
+[Français](0004-versioned-protocol-and-polyglot-activities.md) | [English](0004-versioned-protocol-and-polyglot-activities.en.md)
 
-Activities use stable ids and versions. Existing games integrate through
-adapters and need not be rewritten in Rust.
+# ADR 0004 : Protocole versionné et activités polyglottes
 
+Statut : accepté
+
+Tous les messages de frontière portent une famille et une version de protocole.
+Les versions inconnues échouent explicitement.
+ JSON est le format de frontière
+de la V0 et les fixtures sont des contrats de compatibilité ; les types Rust
+internes ne sont pas conçus autour de JSON arbitraire.
+
+Les activités utilisent des identifiants et des versions stables. Les jeux
+existants s’intègrent par des adaptateurs et n’ont pas à être réécrits en Rust.
