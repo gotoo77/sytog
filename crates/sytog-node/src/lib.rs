@@ -1259,9 +1259,16 @@ pub enum NodeError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        collections::HashSet,
+        sync::atomic::{AtomicBool, Ordering},
+        thread,
+        time::Duration,
+    };
     use sytog_demo_vote::VoteActivity;
     use sytog_demo_vote::VoteState;
-    use sytog_domain::{EventId, EventKind, SessionEventKind};
+    use sytog_domain::{ActiveActivity, ActivityDescriptor, EventId, EventKind, SessionEventKind};
+    use sytog_runtime::{ActivityRejection, ActivityTransition};
 
     fn temporary_directory(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("sytog-{name}-{}", std::process::id()))
@@ -1369,6 +1376,259 @@ mod tests {
         bytes.push(b'\n');
         fs::write(journal.events_path(), bytes).expect("legacy journal is written");
         safe_offset
+    }
+
+    struct DelayedVoteActivity {
+        entered_slow_decision: Arc<AtomicBool>,
+        delay: Duration,
+    }
+
+    impl ActivityEngine for DelayedVoteActivity {
+        fn descriptor(&self) -> ActivityDescriptor {
+            VoteActivity::descriptor()
+        }
+
+        fn initial_state(&self) -> Value {
+            VoteActivity.initial_state()
+        }
+
+        fn decide(
+            &self,
+            actor: &ParticipantId,
+            current: &ActiveActivity,
+            command: &ActivityCommandEnvelope,
+        ) -> Result<ActivityTransition, ActivityRejection> {
+            if command.payload.get("choice").and_then(Value::as_str) == Some("slow") {
+                self.entered_slow_decision.store(true, Ordering::Release);
+                thread::sleep(self.delay);
+            }
+            VoteActivity.decide(actor, current, command)
+        }
+    }
+
+    fn versioned_receipts(path: &Path) -> Vec<AcceptedCommandV1> {
+        let bytes = fs::read(path).expect("journal is readable");
+        let mut receipts = Vec::new();
+        for line in bytes
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.iter().all(u8::is_ascii_whitespace))
+        {
+            let value: Value = serde_json::from_slice(line).expect("journal line is JSON");
+            if value.get("record_type").is_some() {
+                receipts.extend(
+                    serde_json::from_value::<AcceptedBatchV1>(value)
+                        .expect("versioned receipt is valid")
+                        .commands,
+                );
+            }
+        }
+        receipts
+    }
+
+    fn assert_versioned_receipts_are_unique(path: &Path) {
+        let receipts = versioned_receipts(path);
+        let mut message_ids = HashSet::new();
+        for accepted in receipts {
+            assert!(
+                message_ids.insert(accepted.request.message_id.clone()),
+                "a V1 receipt must occur only once in the physical journal"
+            );
+            assert!(
+                !accepted.events.is_empty(),
+                "every accepted-command receipt contains its complete events"
+            );
+        }
+    }
+
+    async fn assert_complete_canonical_history(host: &Host) {
+        let canonical = host.canonical.lock().await;
+        EventLogV0 {
+            family: PROTOCOL_FAMILY.to_owned(),
+            protocol_version: PROTOCOL_VERSION,
+            schema_version: EVENT_LOG_SCHEMA_VERSION,
+            session_id: host.session_id.clone(),
+            base_revision: 0,
+            events: canonical.events.clone(),
+        }
+        .validate()
+        .expect("canonical history has contiguous sequences and unique event ids");
+
+        let receipt_ids: HashSet<_> = canonical.accepted_commands.keys().collect();
+        assert_eq!(
+            receipt_ids.len(),
+            canonical.accepted_commands.len(),
+            "accepted command identifiers are unique"
+        );
+        for accepted in canonical.accepted_commands.values() {
+            assert!(
+                canonical
+                    .events
+                    .windows(accepted.events.len())
+                    .any(|window| window == accepted.events),
+                "every receipt maps to one contiguous event range"
+            );
+        }
+    }
+
+    async fn open_vote_for(host: &Host, participants: &[&str], options: &[&str]) -> CommandRequest {
+        for participant in participants {
+            host.join(
+                ParticipantId::from(*participant),
+                (*participant).to_owned(),
+                MessageId(format!("join-{participant}")),
+            )
+            .await
+            .expect("participant joins");
+        }
+        let request = CommandRequest {
+            message_id: MessageId::from("open-concurrent-vote"),
+            actor: ParticipantId::from(participants[0]),
+            expected_revision: host.current_revision().await,
+            command: Command::Activity(VoteActivity::open(options)),
+        };
+        host.submit(request.clone()).await.expect("vote opens");
+        request
+    }
+
+    async fn spawn_test_server(host: Arc<Host>, connection_count: usize) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test listener binds");
+        let address = listener.local_addr().expect("listener has an address");
+        tokio::spawn(async move {
+            for _ in 0..connection_count {
+                let (stream, peer) = listener.accept().await.expect("client connects");
+                let host = Arc::clone(&host);
+                tokio::spawn(async move {
+                    let _ = handle_connection(stream, peer, host).await;
+                });
+            }
+        });
+        format!("ws://{address}")
+    }
+
+    async fn send_network_message(
+        socket: &mut sytog_transport::ClientSocket,
+        session_id: &SessionId,
+        participant: &ParticipantId,
+        message_id: &MessageId,
+        revision: u64,
+        message: &NetworkMessage,
+    ) {
+        let wrapped = envelope(
+            session_id.clone(),
+            participant.clone(),
+            message_id.clone(),
+            Some(revision),
+            message,
+        )
+        .expect("network message is wrapped");
+        send(socket, &wrapped)
+            .await
+            .expect("network message is sent");
+    }
+
+    async fn submit_from_connection(
+        url: String,
+        session_id: SessionId,
+        participant: ParticipantId,
+        revision: u64,
+        request: CommandRequest,
+        ready: Arc<tokio::sync::Barrier>,
+    ) -> Result<Vec<SessionEvent>, String> {
+        let mut socket = sytog_transport::connect(&url)
+            .await
+            .expect("client connects");
+        send_network_message(
+            &mut socket,
+            &session_id,
+            &participant,
+            &MessageId(format!("hello-{}", participant.0)),
+            revision,
+            &NetworkMessage::Hello {
+                last_sequence: revision,
+            },
+        )
+        .await;
+        send_network_message(
+            &mut socket,
+            &session_id,
+            &participant,
+            &MessageId(format!("rejoin-{}", participant.0)),
+            revision,
+            &NetworkMessage::JoinSession {
+                display_name: participant.0.clone(),
+            },
+        )
+        .await;
+        ready.wait().await;
+        send_network_message(
+            &mut socket,
+            &session_id,
+            &participant,
+            &request.message_id,
+            revision,
+            &NetworkMessage::SubmitCommand {
+                request: request.clone(),
+            },
+        )
+        .await;
+
+        while let Some(incoming) = receive(&mut socket).await.expect("host response is valid") {
+            match decode(&incoming).expect("host message decodes") {
+                NetworkMessage::EventBatch { events, .. }
+                    if events
+                        .iter()
+                        .any(|event| event.causation_id == request.message_id) =>
+                {
+                    return Ok(events);
+                }
+                NetworkMessage::CommandRejected {
+                    message_id, code, ..
+                } if message_id == request.message_id => return Err(code),
+                _ => {}
+            }
+        }
+        panic!("connection closed without a command outcome");
+    }
+
+    async fn catch_up_connection(
+        url: &str,
+        session_id: &SessionId,
+        participant: &str,
+    ) -> ClientReplica {
+        let participant = ParticipantId::from(participant);
+        let mut socket = sytog_transport::connect(url)
+            .await
+            .expect("catch-up client connects");
+        send_network_message(
+            &mut socket,
+            session_id,
+            &participant,
+            &MessageId(format!("catch-up-{}", participant.0)),
+            0,
+            &NetworkMessage::Hello { last_sequence: 0 },
+        )
+        .await;
+        let incoming = receive(&mut socket)
+            .await
+            .expect("catch-up response is valid")
+            .expect("host sends catch-up batch");
+        let NetworkMessage::EventBatch { events, .. } =
+            decode(&incoming).expect("catch-up batch decodes")
+        else {
+            panic!("expected catch-up event batch");
+        };
+        let mut replica = ClientReplica::uninitialized(session_id.clone());
+        for event in events {
+            assert_eq!(
+                replica
+                    .apply_received_event(&event)
+                    .expect("catch-up event applies"),
+                ReceivedEvent::Applied
+            );
+        }
+        replica
     }
 
     #[test]
@@ -1773,6 +2033,460 @@ mod tests {
             .await
             .expect("a rejected identifier is not retained");
         assert_eq!(restarted.current_revision().await, 4);
+        fs::remove_dir_all(directory).expect("test directory can be removed");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_distinct_commands_at_one_revision_are_linearized() {
+        let (directory, config) = server_config("concurrent-same-revision");
+        let host =
+            Arc::new(Host::load_or_create(&config, Arc::new(VoteActivity)).expect("host starts"));
+        open_vote_for(&host, &["alice", "bob"], &["tea", "coffee"]).await;
+        let revision = host.current_revision().await;
+        let alice = CommandRequest {
+            message_id: MessageId::from("alice-concurrent-vote"),
+            actor: ParticipantId::from("alice"),
+            expected_revision: revision,
+            command: Command::Activity(VoteActivity::submit("tea")),
+        };
+        let bob = CommandRequest {
+            message_id: MessageId::from("bob-concurrent-vote"),
+            actor: ParticipantId::from("bob"),
+            expected_revision: revision,
+            command: Command::Activity(VoteActivity::submit("coffee")),
+        };
+
+        let alice_host = Arc::clone(&host);
+        let bob_host = Arc::clone(&host);
+        let (alice_result, bob_result) = tokio::join!(
+            tokio::spawn(async move { alice_host.submit(alice).await }),
+            tokio::spawn(async move { bob_host.submit(bob).await }),
+        );
+        let outcomes = [
+            alice_result.expect("Alice task completes"),
+            bob_result.expect("Bob task completes"),
+        ];
+        assert_eq!(outcomes.iter().filter(|outcome| outcome.is_ok()).count(), 1);
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter_map(|outcome| outcome.as_ref().err())
+                .filter(|rejection| rejection.code == "revision_conflict")
+                .count(),
+            1
+        );
+        assert_eq!(host.current_revision().await, revision + 1);
+        assert_complete_canonical_history(&host).await;
+        assert_versioned_receipts_are_unique(&journal_path(&config));
+        drop(host);
+        fs::remove_dir_all(directory).expect("test directory can be removed");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_identical_command_is_appended_once_and_replayed_to_both_callers() {
+        let (directory, config) = server_config("concurrent-identical-command");
+        let host =
+            Arc::new(Host::load_or_create(&config, Arc::new(VoteActivity)).expect("host starts"));
+        host.join(
+            ParticipantId::from("alice"),
+            "Alice".to_owned(),
+            MessageId::from("join-alice"),
+        )
+        .await
+        .expect("Alice joins");
+        let request = CommandRequest {
+            message_id: MessageId::from("same-command"),
+            actor: ParticipantId::from("alice"),
+            expected_revision: 2,
+            command: Command::Activity(VoteActivity::open(&["tea", "coffee"])),
+        };
+        let first_host = Arc::clone(&host);
+        let second_host = Arc::clone(&host);
+        let first_request = request.clone();
+        let second_request = request.clone();
+        let (first, second) = tokio::join!(
+            tokio::spawn(async move { first_host.submit(first_request).await }),
+            tokio::spawn(async move { second_host.submit(second_request).await }),
+        );
+        let first = first
+            .expect("first task completes")
+            .expect("first succeeds");
+        let second = second
+            .expect("second task completes")
+            .expect("second succeeds");
+
+        assert_eq!(first.events, second.events);
+        assert_ne!(first.duplicate, second.duplicate);
+        assert_eq!(host.current_revision().await, 4);
+        assert_eq!(
+            versioned_receipts(&journal_path(&config))
+                .iter()
+                .filter(|accepted| accepted.request.message_id == request.message_id)
+                .count(),
+            1
+        );
+        let accepted = host
+            .canonical
+            .lock()
+            .await
+            .accepted_commands
+            .get(&request.message_id)
+            .expect("receipt is indexed")
+            .clone();
+        assert_eq!(accepted.events, first.events);
+        assert_eq!(
+            accepted
+                .events
+                .windows(2)
+                .next()
+                .expect("auto-start command has two events")[1]
+                .sequence,
+            accepted.events[0].sequence + 1
+        );
+        assert_complete_canonical_history(&host).await;
+        assert_versioned_receipts_are_unique(&journal_path(&config));
+        drop(host);
+        fs::remove_dir_all(directory).expect("test directory can be removed");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_command_id_collision_has_one_winner_and_one_explicit_rejection() {
+        let (directory, config) = server_config("concurrent-command-id-collision");
+        let host =
+            Arc::new(Host::load_or_create(&config, Arc::new(VoteActivity)).expect("host starts"));
+        open_vote_for(&host, &["alice"], &["tea", "coffee"]).await;
+        let revision = host.current_revision().await;
+        let tea = CommandRequest {
+            message_id: MessageId::from("colliding-command"),
+            actor: ParticipantId::from("alice"),
+            expected_revision: revision,
+            command: Command::Activity(VoteActivity::submit("tea")),
+        };
+        let coffee = CommandRequest {
+            command: Command::Activity(VoteActivity::submit("coffee")),
+            ..tea.clone()
+        };
+        let tea_host = Arc::clone(&host);
+        let coffee_host = Arc::clone(&host);
+        let (tea_result, coffee_result) = tokio::join!(
+            tokio::spawn(async move { tea_host.submit(tea).await }),
+            tokio::spawn(async move { coffee_host.submit(coffee).await }),
+        );
+        let outcomes = [
+            tea_result.expect("tea task completes"),
+            coffee_result.expect("coffee task completes"),
+        ];
+        assert_eq!(outcomes.iter().filter(|outcome| outcome.is_ok()).count(), 1);
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter_map(|outcome| outcome.as_ref().err())
+                .filter(|rejection| rejection.code == "command_id_collision")
+                .count(),
+            1
+        );
+        assert_eq!(
+            versioned_receipts(&journal_path(&config))
+                .iter()
+                .filter(|accepted| accepted.request.message_id.0 == "colliding-command")
+                .count(),
+            1
+        );
+        assert_complete_canonical_history(&host).await;
+        assert_versioned_receipts_are_unique(&journal_path(&config));
+        drop(host);
+        fs::remove_dir_all(directory).expect("test directory can be removed");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn slow_command_holds_its_place_without_partial_interleaving() {
+        let (directory, config) = server_config("slow-command-linearization");
+        let entered = Arc::new(AtomicBool::new(false));
+        let activity = Arc::new(DelayedVoteActivity {
+            entered_slow_decision: Arc::clone(&entered),
+            delay: Duration::from_millis(100),
+        });
+        let host = Arc::new(Host::load_or_create(&config, activity).expect("host starts"));
+        open_vote_for(&host, &["alice", "bob"], &["slow", "fast"]).await;
+        let revision = host.current_revision().await;
+        let slow = CommandRequest {
+            message_id: MessageId::from("slow-command"),
+            actor: ParticipantId::from("alice"),
+            expected_revision: revision,
+            command: Command::Activity(VoteActivity::submit("slow")),
+        };
+        let fast = CommandRequest {
+            message_id: MessageId::from("fast-command"),
+            actor: ParticipantId::from("bob"),
+            expected_revision: revision + 1,
+            command: Command::Activity(VoteActivity::submit("fast")),
+        };
+
+        let slow_host = Arc::clone(&host);
+        let slow_task = tokio::spawn(async move { slow_host.submit(slow).await });
+        while !entered.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+        let fast_host = Arc::clone(&host);
+        let fast_task = tokio::spawn(async move { fast_host.submit(fast).await });
+        let slow_result = slow_task
+            .await
+            .expect("slow task completes")
+            .expect("slow command succeeds");
+        let fast_result = fast_task
+            .await
+            .expect("fast task completes")
+            .expect("fast command succeeds");
+
+        assert_eq!(slow_result.events[0].sequence, revision + 1);
+        assert_eq!(fast_result.events[0].sequence, revision + 2);
+        assert_complete_canonical_history(&host).await;
+        assert_versioned_receipts_are_unique(&journal_path(&config));
+        drop(host);
+        fs::remove_dir_all(directory).expect("test directory can be removed");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn separate_connections_share_one_canonical_order_and_catch_up_state() {
+        let (directory, config) = server_config("concurrent-connections");
+        let host =
+            Arc::new(Host::load_or_create(&config, Arc::new(VoteActivity)).expect("host starts"));
+        open_vote_for(&host, &["alice", "bob"], &["tea", "coffee"]).await;
+        let revision = host.current_revision().await;
+        let url = spawn_test_server(Arc::clone(&host), 4).await;
+        let ready = Arc::new(tokio::sync::Barrier::new(2));
+        let alice_request = CommandRequest {
+            message_id: MessageId::from("alice-network-vote"),
+            actor: ParticipantId::from("alice"),
+            expected_revision: revision,
+            command: Command::Activity(VoteActivity::submit("tea")),
+        };
+        let bob_request = CommandRequest {
+            message_id: MessageId::from("bob-network-vote"),
+            actor: ParticipantId::from("bob"),
+            expected_revision: revision,
+            command: Command::Activity(VoteActivity::submit("coffee")),
+        };
+        let (alice, bob) = tokio::join!(
+            submit_from_connection(
+                url.clone(),
+                config.session_id.clone(),
+                ParticipantId::from("alice"),
+                revision,
+                alice_request,
+                Arc::clone(&ready),
+            ),
+            submit_from_connection(
+                url.clone(),
+                config.session_id.clone(),
+                ParticipantId::from("bob"),
+                revision,
+                bob_request,
+                Arc::clone(&ready),
+            ),
+        );
+        let outcomes = [alice, bob];
+        assert_eq!(outcomes.iter().filter(|outcome| outcome.is_ok()).count(), 1);
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| { matches!(outcome, Err(code) if code == "revision_conflict") })
+                .count(),
+            1
+        );
+
+        let (alice_replica, bob_replica) = tokio::join!(
+            catch_up_connection(&url, &config.session_id, "catch-up-alice"),
+            catch_up_connection(&url, &config.session_id, "catch-up-bob"),
+        );
+        let canonical_state = host.canonical.lock().await.state.clone();
+        assert_eq!(alice_replica.state, canonical_state);
+        assert_eq!(bob_replica.state, canonical_state);
+        assert_complete_canonical_history(&host).await;
+        assert_versioned_receipts_are_unique(&journal_path(&config));
+        drop(host);
+        fs::remove_dir_all(directory).expect("test directory can be removed");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn disconnect_during_acceptance_does_not_erase_a_durable_command() {
+        let (directory, config) = server_config("disconnect-during-acceptance");
+        let entered = Arc::new(AtomicBool::new(false));
+        let activity = Arc::new(DelayedVoteActivity {
+            entered_slow_decision: Arc::clone(&entered),
+            delay: Duration::from_millis(100),
+        });
+        let host = Arc::new(Host::load_or_create(&config, activity).expect("host starts"));
+        open_vote_for(&host, &["alice"], &["slow", "other"]).await;
+        let revision = host.current_revision().await;
+        let url = spawn_test_server(Arc::clone(&host), 1).await;
+        let mut socket = sytog_transport::connect(&url)
+            .await
+            .expect("client connects");
+        let participant = ParticipantId::from("alice");
+        send_network_message(
+            &mut socket,
+            &config.session_id,
+            &participant,
+            &MessageId::from("disconnect-hello"),
+            revision,
+            &NetworkMessage::Hello {
+                last_sequence: revision,
+            },
+        )
+        .await;
+        send_network_message(
+            &mut socket,
+            &config.session_id,
+            &participant,
+            &MessageId::from("disconnect-rejoin"),
+            revision,
+            &NetworkMessage::JoinSession {
+                display_name: "Alice".to_owned(),
+            },
+        )
+        .await;
+        let request = CommandRequest {
+            message_id: MessageId::from("disconnect-command"),
+            actor: participant.clone(),
+            expected_revision: revision,
+            command: Command::Activity(VoteActivity::submit("slow")),
+        };
+        send_network_message(
+            &mut socket,
+            &config.session_id,
+            &participant,
+            &request.message_id,
+            revision,
+            &NetworkMessage::SubmitCommand {
+                request: request.clone(),
+            },
+        )
+        .await;
+        while !entered.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+        socket.close(None).await.expect("client disconnects");
+        assert_eq!(host.current_revision().await, revision + 1);
+        assert!(
+            host.canonical
+                .lock()
+                .await
+                .accepted_commands
+                .contains_key(&request.message_id)
+        );
+        drop(host);
+
+        let restarted = Host::load_or_create(&config, Arc::new(VoteActivity))
+            .expect("durable command survives restart");
+        assert_eq!(restarted.current_revision().await, revision + 1);
+        assert!(
+            restarted
+                .canonical
+                .lock()
+                .await
+                .accepted_commands
+                .contains_key(&request.message_id)
+        );
+        fs::remove_dir_all(directory).expect("test directory can be removed");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_burst_accounts_for_every_command_without_history_gaps() {
+        let (directory, config) = server_config("concurrent-burst");
+        let host =
+            Arc::new(Host::load_or_create(&config, Arc::new(VoteActivity)).expect("host starts"));
+        let participants: Vec<_> = (0..12).map(|index| format!("client-{index}")).collect();
+        let participant_refs: Vec<_> = participants.iter().map(String::as_str).collect();
+        open_vote_for(&host, &participant_refs, &["yes", "no"]).await;
+        let revision = host.current_revision().await;
+        let url = spawn_test_server(Arc::clone(&host), participants.len()).await;
+        let ready = Arc::new(tokio::sync::Barrier::new(participants.len()));
+        let tasks: Vec<_> = participants
+            .into_iter()
+            .enumerate()
+            .map(|(index, participant)| {
+                let request = CommandRequest {
+                    message_id: MessageId(format!("burst-{index}")),
+                    actor: ParticipantId::from(participant.as_str()),
+                    expected_revision: revision,
+                    command: Command::Activity(VoteActivity::submit(if index % 2 == 0 {
+                        "yes"
+                    } else {
+                        "no"
+                    })),
+                };
+                submit_from_connection(
+                    url.clone(),
+                    config.session_id.clone(),
+                    ParticipantId::from(participant.as_str()),
+                    revision,
+                    request,
+                    Arc::clone(&ready),
+                )
+            })
+            .collect();
+        let outcomes = futures_util::future::join_all(tasks).await;
+        assert_eq!(outcomes.len(), 12);
+        assert_eq!(outcomes.iter().filter(|outcome| outcome.is_ok()).count(), 1);
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| { matches!(outcome, Err(code) if code == "revision_conflict") })
+                .count(),
+            11
+        );
+        assert_eq!(host.current_revision().await, revision + 1);
+        assert_complete_canonical_history(&host).await;
+        assert_versioned_receipts_are_unique(&journal_path(&config));
+        drop(host);
+        fs::remove_dir_all(directory).expect("test directory can be removed");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_order_and_receipts_survive_restart_and_replay() {
+        let (directory, config) = server_config("concurrent-restart-order");
+        let host =
+            Arc::new(Host::load_or_create(&config, Arc::new(VoteActivity)).expect("host starts"));
+        let tasks: Vec<_> = (0..20)
+            .map(|index| {
+                let host = Arc::clone(&host);
+                tokio::spawn(async move {
+                    host.join(
+                        ParticipantId(format!("participant-{index}")),
+                        format!("Participant {index}"),
+                        MessageId(format!("concurrent-join-{index}")),
+                    )
+                    .await
+                })
+            })
+            .collect();
+        for outcome in futures_util::future::join_all(tasks).await {
+            outcome
+                .expect("join task completes")
+                .expect("concurrent join succeeds");
+        }
+        assert_complete_canonical_history(&host).await;
+        assert_versioned_receipts_are_unique(&journal_path(&config));
+        let (before_state, before_events, before_receipts) = {
+            let canonical = host.canonical.lock().await;
+            (
+                canonical.state.clone(),
+                canonical.events.clone(),
+                canonical.accepted_commands.clone(),
+            )
+        };
+        drop(host);
+
+        let restarted =
+            Host::load_or_create(&config, Arc::new(VoteActivity)).expect("host replays journal");
+        let canonical = restarted.canonical.lock().await;
+        assert_eq!(canonical.state, before_state);
+        assert_eq!(canonical.events, before_events);
+        assert_eq!(canonical.accepted_commands, before_receipts);
+        drop(canonical);
+        assert_complete_canonical_history(&restarted).await;
+        assert_versioned_receipts_are_unique(&journal_path(&config));
         fs::remove_dir_all(directory).expect("test directory can be removed");
     }
 
