@@ -1,6 +1,6 @@
 [Français](README.md) | [English](README.en.md)
 
-# Documentation SYTOG
+# Documentation SYTOG (SYnchronize TOGether)
 
 ## Convention linguistique
 
