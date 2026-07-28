@@ -535,6 +535,10 @@ disponible.
   `events_after(3)` ;
 - `separate_connections_share_one_canonical_order_and_catch_up_state` vérifie
   un `Hello` WebSocket depuis zéro et la convergence de deux réplicas neufs ;
+- `persisted_old_replica_catches_up_large_suffix_after_host_restart` persiste
+  un réplica à la révision 25, produit un suffixe de 276 événements — supérieur
+  à la capacité de 256 lots du canal broadcast —, redémarre l’hôte, puis
+  vérifie le lot `26..301`, la convergence et une nouvelle relecture locale ;
 - la reconnexion d’un client en retard et le redémarrage de l’hôte ont été
   vérifiés manuellement pendant la V0.2.
 
@@ -589,10 +593,11 @@ comportement lors du dépassement des 256 lots.
    d’un suffixe incomplet sont désormais définies.
 3. **Concurrence — terminée** : la linéarisation mono-hôte, la contiguïté et la
    durabilité de l’ordre sont caractérisées.
-4. **Reconnexion ancienne** — vérifier la convergence sur un suffixe important.
-5. **Pression et backpressure** — mesurer les bornes après stabilisation des
-   sémantiques précédentes.
+4. **Reconnexion ancienne — terminée** : un réplica persisté rattrape après
+   redémarrage un suffixe plus grand que la capacité du canal broadcast.
+5. **Pression et backpressure — prochaine** : mesurer les bornes maintenant que
+   les sémantiques précédentes sont caractérisées.
 
-Les trois premières familles protègent maintenant l’identité, la récupération
-et l’ordre du journal canonique. La reconnexion ancienne est la prochaine
-expérience ; la pression reste différée jusqu’à stabilisation du rattrapage.
+Les quatre premières familles protègent maintenant l’identité, la récupération,
+l’ordre et le rattrapage du journal canonique. La pression et la backpressure
+constituent la prochaine expérience.

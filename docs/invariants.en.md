@@ -523,6 +523,10 @@ sent, and no strategy if the suffix is no longer available.
   `events_after(3)`;
 - `separate_connections_share_one_canonical_order_and_catch_up_state`
   verifies a WebSocket `Hello` from zero and convergence of two fresh replicas;
+- `persisted_old_replica_catches_up_large_suffix_after_host_restart` persists
+  a replica at revision 25, produces a 276-event suffix — larger than the
+  broadcast channel's 256-batch capacity —, restarts the host, then verifies
+  batch `26..301`, convergence, and another local reload;
 - reconnecting a lagging client and restarting the host were checked manually
   during V0.2.
 
@@ -576,10 +580,10 @@ batches.
    recovery are now defined.
 3. **Concurrency — complete**: single-host linearization, contiguity, and order
    durability are characterized.
-4. **Old reconnection** — verify convergence over a large suffix.
-5. **Pressure and backpressure** — measure bounds after the previous semantics
-   are stable.
+4. **Old reconnection — complete**: a persisted replica catches up after host
+   restart over a suffix larger than the broadcast channel capacity.
+5. **Pressure and backpressure — next**: measure bounds now that the previous
+   semantics are characterized.
 
-The first three families now protect canonical-journal identity, recovery, and
-ordering. Old reconnection is the next experiment; pressure remains deferred
-until catch-up behavior is stable.
+The first four families now protect canonical-journal identity, recovery,
+ordering, and catch-up. Pressure and backpressure are the next experiment.

@@ -1598,11 +1598,12 @@ mod tests {
         .expect("host returns a command outcome before the test timeout")
     }
 
-    async fn catch_up_connection(
+    async fn receive_catch_up_batch(
         url: &str,
         session_id: &SessionId,
         participant: &str,
-    ) -> ClientReplica {
+        last_sequence: u64,
+    ) -> (u64, Vec<SessionEvent>) {
         let participant = ParticipantId::from(participant);
         let mut socket = sytog_transport::connect(url)
             .await
@@ -1612,19 +1613,31 @@ mod tests {
             session_id,
             &participant,
             &MessageId(format!("catch-up-{}", participant.0)),
-            0,
-            &NetworkMessage::Hello { last_sequence: 0 },
+            last_sequence,
+            &NetworkMessage::Hello { last_sequence },
         )
         .await;
-        let incoming = receive(&mut socket)
+        let incoming = tokio::time::timeout(ASYNC_TEST_TIMEOUT, receive(&mut socket))
             .await
+            .expect("catch-up response arrives before the test timeout")
             .expect("catch-up response is valid")
             .expect("host sends catch-up batch");
-        let NetworkMessage::EventBatch { events, .. } =
-            decode(&incoming).expect("catch-up batch decodes")
+        let NetworkMessage::EventBatch {
+            from_sequence,
+            events,
+        } = decode(&incoming).expect("catch-up batch decodes")
         else {
             panic!("expected catch-up event batch");
         };
+        (from_sequence, events)
+    }
+
+    async fn catch_up_connection(
+        url: &str,
+        session_id: &SessionId,
+        participant: &str,
+    ) -> ClientReplica {
+        let (_, events) = receive_catch_up_batch(url, session_id, participant, 0).await;
         let mut replica = ClientReplica::uninitialized(session_id.clone());
         for event in events {
             assert_eq!(
@@ -2501,6 +2514,102 @@ mod tests {
         drop(canonical);
         assert_complete_canonical_history(&restarted).await;
         assert_versioned_receipts_are_unique(&journal_path(&config));
+        fs::remove_dir_all(directory).expect("test directory can be removed");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn persisted_old_replica_catches_up_large_suffix_after_host_restart() {
+        const PARTICIPANT_COUNT: usize = 300;
+        const CHECKPOINT_PARTICIPANTS: usize = 24;
+
+        let (directory, config) = server_config("old-replica-large-catch-up");
+        let host = Host::load_or_create(&config, Arc::new(VoteActivity)).expect("host bootstraps");
+        for index in 0..CHECKPOINT_PARTICIPANTS {
+            host.join(
+                ParticipantId(format!("participant-{index}")),
+                format!("Participant {index}"),
+                MessageId(format!("join-{index}")),
+            )
+            .await
+            .expect("checkpoint participant joins");
+        }
+
+        let checkpoint_events = host.canonical.lock().await.events.clone();
+        let mut stale_replica = ClientReplica::uninitialized(config.session_id.clone());
+        for event in &checkpoint_events {
+            assert_eq!(
+                stale_replica
+                    .apply_received_event(event)
+                    .expect("checkpoint event applies"),
+                ReceivedEvent::Applied
+            );
+        }
+        let checkpoint_revision = stale_replica.state.revision;
+        let client_config = ClientConfig {
+            url: "ws://127.0.0.1:0".to_owned(),
+            data_dir: directory.clone(),
+            session_id: config.session_id.clone(),
+            participant_id: ParticipantId::from("old-client"),
+        };
+        save_client_replica(&client_config, &stale_replica).expect("old replica persists");
+        let mut stale_replica = load_client_replica(&client_config).expect("old replica reloads");
+        assert_eq!(stale_replica.state.revision, checkpoint_revision);
+
+        for index in CHECKPOINT_PARTICIPANTS..PARTICIPANT_COUNT {
+            host.join(
+                ParticipantId(format!("participant-{index}")),
+                format!("Participant {index}"),
+                MessageId(format!("join-{index}")),
+            )
+            .await
+            .expect("later participant joins");
+        }
+        let final_revision = host.current_revision().await;
+        assert!(
+            final_revision - checkpoint_revision > 256,
+            "the stale suffix exceeds the broadcast channel capacity"
+        );
+        drop(host);
+
+        let restarted = Arc::new(
+            Host::load_or_create(&config, Arc::new(VoteActivity))
+                .expect("host replays the complete journal"),
+        );
+        let canonical_state = restarted.canonical.lock().await.state.clone();
+        assert_eq!(restarted.current_revision().await, final_revision);
+        let url = spawn_test_server(Arc::clone(&restarted), 1).await;
+        let (from_sequence, events) =
+            receive_catch_up_batch(&url, &config.session_id, "old-client", checkpoint_revision)
+                .await;
+
+        assert_eq!(from_sequence, checkpoint_revision + 1);
+        assert_eq!(
+            u64::try_from(events.len()).expect("suffix length fits"),
+            final_revision - checkpoint_revision
+        );
+        assert_eq!(
+            events.first().expect("suffix has a first event").sequence,
+            checkpoint_revision + 1
+        );
+        assert_eq!(
+            events.last().expect("suffix has a last event").sequence,
+            final_revision
+        );
+        for event in &events {
+            assert_eq!(
+                stale_replica
+                    .apply_received_event(event)
+                    .expect("catch-up event applies"),
+                ReceivedEvent::Applied
+            );
+        }
+        assert_eq!(stale_replica.state, canonical_state);
+        save_client_replica(&client_config, &stale_replica).expect("caught-up replica persists");
+        let reloaded = load_client_replica(&client_config).expect("caught-up replica reloads");
+        assert_eq!(reloaded.state, canonical_state);
+        assert_eq!(reloaded.events, stale_replica.events);
+
+        drop(restarted);
         fs::remove_dir_all(directory).expect("test directory can be removed");
     }
 
