@@ -560,11 +560,15 @@ lots, mais le journal canonique reste intégralement dans un `Vec`. Chaque
 `events_after` filtre et clone tout le suffixe demandé dans un nouveau `Vec`.
 L’historique d’identité du client V1 conserve également tous les événements
 reçus après sa révision de base. Un récepteur en retard retombe sur ce même
-rattrapage complet. Il n’existe ni pagination, fenêtre maximale, compaction,
-quota ni refus de surcharge.
+rattrapage complet. Chaque connexion acceptée crée en outre une tâche sans
+quota global ou par adresse. Il n’existe ni pagination, fenêtre maximale,
+compaction, limite de connexion, timeout d’écriture, quota ni refus de
+surcharge.
 
 **Point d’application actuel.**
 
+- création sans limite des tâches de connexion dans
+  [`serve`](../crates/sytog-node/src/lib.rs#L137-L169) ;
 - capacité du canal dans
   [`Host::load_or_create`](../crates/sytog-node/src/lib.rs#L526-L537) ;
 - récupération après `Lagged` dans
@@ -572,13 +576,23 @@ quota ni refus de surcharge.
 - clone non borné du suffixe dans
   [`Host::events_after`](../crates/sytog-node/src/lib.rs#L712-L721).
 
-**Comportement actuel sous pression.** Le journal mémoire croît avec la session.
-Un catch-up ancien alloue proportionnellement au suffixe. Un client lent peut
-prendre du retard ; sa tâche tente ensuite de cloner et transmettre tous les
-événements manquants. Aucune borne de service n’est garantie.
+**Comportement actuel sous pression.** L’émission dans le canal n’attend pas les
+abonnés : les commits continuent et les lots les plus anciens sont évincés pour
+un récepteur lent. À son prochain `recv`, celui-ci observe `Lagged`, clone tout
+le suffixe manquant sous le verrou canonique, puis tente de le transmettre dans
+un unique `EventBatch`. Le journal mémoire et l’historique client croissent avec
+la session ; le clone et la sérialisation du catch-up croissent avec le suffixe.
+Une écriture réseau lente bloque sa tâche de connexion, mais pas explicitement
+le producteur canonique. Aucune borne de mémoire, de connexion, de taille de
+lot, de délai d’écriture ou de service n’est garantie.
 
-**Tests existants.** Aucun test de charge, de client lent, de canal saturé ou de
-client très ancien.
+**Tests existants.**
+
+- `persisted_old_replica_catches_up_large_suffix_after_host_restart` observe un
+  lot unique de 276 événements ;
+- `saturated_broadcast_drops_old_batches_without_blocking_commits_and_recovers`
+  laisse un abonné inactif pendant 300 commits, observe `Lagged`, puis vérifie
+  la récupération contiguë des 300 événements et la convergence.
 
 **Tentative de rupture reproductible.** Produire un grand journal, maintenir un
 client qui ne lit pas sa socket, puis demander depuis la séquence zéro avec un
@@ -595,9 +609,10 @@ comportement lors du dépassement des 256 lots.
    durabilité de l’ordre sont caractérisées.
 4. **Reconnexion ancienne — terminée** : un réplica persisté rattrape après
    redémarrage un suffixe plus grand que la capacité du canal broadcast.
-5. **Pression et backpressure — prochaine** : mesurer les bornes maintenant que
-   les sémantiques précédentes sont caractérisées.
+5. **Pression et backpressure — caractérisée** : le producteur ne ralentit pas,
+   le canal évince les anciens lots et le rattrapage complet reste non borné ;
+   INV-012 demeure réfuté / limité.
 
-Les quatre premières familles protègent maintenant l’identité, la récupération,
-l’ordre et le rattrapage du journal canonique. La pression et la backpressure
-constituent la prochaine expérience.
+Les cinq expériences de rupture sont maintenant caractérisées. La prochaine
+étape n’est plus une mesure exploratoire : elle exige de choisir un contrat de
+surcharge explicite avant toute correction de production.
