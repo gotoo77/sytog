@@ -302,7 +302,9 @@ pour dédupliquer rétrospectivement leurs commandes. L’identité compare tout
 - `accepted_command_id_with_different_content_is_rejected_explicitly` ;
 - `accepted_command_deduplication_survives_restart` ;
 - `rejected_command_id_can_be_reevaluated` ;
-- `host_loads_legacy_events_and_appends_versioned_acceptances`.
+- `host_loads_legacy_events_and_appends_versioned_acceptances` ;
+- `concurrent_identical_command_is_appended_once_and_replayed_to_both_callers` ;
+- `concurrent_command_id_collision_has_one_winner_and_one_explicit_rejection`.
 
 **Tentative de rupture reproductible.** Soumettre une commande, conserver sa
 requête et ses événements, redémarrer l’hôte, puis resoumettre exactement la
@@ -317,14 +319,18 @@ requête en gardant `message_id` : l’hôte doit répondre
 
 **Énoncé exact.** Dans un processus hôte V0.2, les commandes de session et
 d’activité qui atteignent `Host::join` ou `Host::submit` sont traitées une à la
-fois sous le même verrou canonique. Chaque commande acceptée observe une
-révision et inscrit ses événements dans un ordre total unique.
+fois sous le même verrou canonique. Décision, validation prospective, append
+durable, commit mémoire et émission du lot ne peuvent pas s’entrelacer avec une
+autre commande. Les événements d’un même reçu restent atomiques et contigus.
+L’ordre des commandes acceptées dans le journal est l’unique ordre canonique.
 
 **Hypothèses et périmètre.** Il existe un seul processus autoritaire et une
 seule instance `Host`. L’ordre d’acquisition du verrou entre commandes
 concurrentes n’est pas prédéterminé ni nécessairement identique entre deux
-exécutions. Seul l’ordre finalement inscrit au journal est canonique et
-reproductible par replay.
+exécutions. La garantie ne porte ni sur l’ordre d’arrivée réseau, ni sur l’ordre
+temporel global, ni sur l’équité ou l’absence de famine. Une décision
+d’activité lente retarde les commandes suivantes. Seul l’ordre finalement
+synchronisé dans le journal est canonique et reproductible par replay.
 
 **Point d’application.**
 
@@ -334,21 +340,39 @@ reproductible par replay.
 - validation, persistance et commit restent sous cette garde jusqu’à la fin de
   [`Host::commit`](../crates/sytog-node/src/lib.rs#L643-L710).
 
-**Comportement en cas de concurrence.** Une commande gagne le verrou et peut
-être acceptée. Une autre commande portant la même `expected_revision` est
-ensuite refusée avec `revision_conflict`. Il n’existe ni fusion ni ordre
-distribué entre plusieurs autorités.
+**Comportement en cas de concurrence.**
+
+- deux commandes distinctes à la même révision : la première acceptée avance
+  la révision ; l’autre est refusée avec `revision_conflict` ;
+- même commande acceptée soumise deux fois : un append unique et le même
+  résultat pour les deux appelants selon INV-007 ;
+- même `message_id` et contenus différents : une acceptation éventuelle puis
+  `command_id_collision` ;
+- une connexion fermée n’annule pas une commande dont l’append durable a
+  réussi ;
+- une rafale ne perd aucune issue interne : chaque soumission observée par
+  l’hôte devient succès, doublon ou rejet structuré. Un client déconnecté peut
+  ne pas recevoir cette issue et doit reprendre par déduplication ou catch-up.
+
+Il n’existe ni fusion ni ordre distribué entre plusieurs autorités.
 
 **Tests existants.**
 
-- `sytog_node::tests::two_participants_converge_and_catch_up_from_the_journal`
-  vérifie le refus d’une révision obsolète ;
-- aucun test ne déclenche encore réellement plusieurs soumissions simultanées.
+- `concurrent_distinct_commands_at_one_revision_are_linearized` ;
+- `concurrent_identical_command_is_appended_once_and_replayed_to_both_callers` ;
+- `concurrent_command_id_collision_has_one_winner_and_one_explicit_rejection` ;
+- `slow_command_holds_its_place_without_partial_interleaving` ;
+- `separate_connections_share_one_canonical_order_and_catch_up_state` ;
+- `disconnect_during_acceptance_does_not_erase_a_durable_command` ;
+- `concurrent_burst_accounts_for_every_command_without_history_gaps` ;
+- `concurrent_order_and_receipts_survive_restart_and_replay`.
 
-**Tentative de rupture reproductible.** Ouvrir dix connexions, leur donner la
-même dernière révision, puis libérer simultanément dix commandes valides.
-Vérifier qu’un seul ordre contigu apparaît au journal, que les perdants
-obsolètes reçoivent un refus structuré et que le replay reproduit cet ordre.
+**Tentative de rupture reproductible.** Ouvrir plusieurs connexions, les
+libérer simultanément avec une même révision, retarder artificiellement une
+décision, puis fermer une connexion pendant son traitement. Vérifier les
+séquences, `event_id`, reçus physiques V1, contiguïté multi-événements,
+réponses, diffusion et catch-up. Redémarrer et comparer exactement état,
+événements et index des reçus.
 
 ### INV-013 — Persistance avant commit mémoire et diffusion
 
@@ -375,8 +399,12 @@ a laissé un suffixe final non terminé, le prochain redémarrage applique INV-0
 après validation du préfixe.
 
 **Tests existants.** Les tests de déduplication après redémarrage et de journal
-mixte V0/V1 couvrent le chemin de succès. Aucun test n’injecte encore un crash
-ou une erreur à chaque point de l’append.
+mixte V0/V1 couvrent le chemin de succès.
+`disconnect_during_acceptance_does_not_erase_a_durable_command` démontre
+qu’une perte de connexion ne retire pas un fait accepté.
+`concurrent_order_and_receipts_survive_restart_and_replay` compare l’histoire
+avant et après redémarrage. Aucun test n’injecte encore un crash ou une erreur à
+chaque point de l’append.
 
 **Tentative de rupture reproductible.** Utiliser un stockage instrumenté qui
 échoue après N octets pour chaque valeur de N dans un lot multi-événements.
@@ -415,6 +443,9 @@ détecte actuellement une divergence silencieuse.
 
 - `sytog_node::tests::two_participants_converge_and_catch_up_from_the_journal`
   exerce deux participants et le suffixe d’événements ;
+- `separate_connections_share_one_canonical_order_and_catch_up_state` exerce
+  deux soumissions WebSocket concurrentes puis deux réplicas neufs rattrapés
+  depuis la séquence zéro ;
 - le parcours manuel V0.2 a produit des snapshots hôte, Alice et Bob
   sémantiquement et octet pour octet identiques avec la même implémentation.
 
@@ -500,8 +531,10 @@ disponible.
 
 **Tests et expériences existants.**
 
-- le test `two_participants_converge_and_catch_up_from_the_journal` vérifie
-  `events_after(3)` mais pas une reconnexion WebSocket complète ;
+- `two_participants_converge_and_catch_up_from_the_journal` vérifie
+  `events_after(3)` ;
+- `separate_connections_share_one_canonical_order_and_catch_up_state` vérifie
+  un `Hello` WebSocket depuis zéro et la convergence de deux réplicas neufs ;
 - la reconnexion d’un client en retard et le redémarrage de l’hôte ont été
   vérifiés manuellement pendant la V0.2.
 
@@ -554,12 +587,12 @@ comportement lors du dépassement des 256 lots.
    des commandes acceptées sont désormais définies.
 2. **Corruption JSONL — terminée** : la frontière de commit et la récupération
    d’un suffixe incomplet sont désormais définies.
-3. **Concurrence — prochaine** : éprouver l’ordre canonique une fois l’histoire
-   fiable.
+3. **Concurrence — terminée** : la linéarisation mono-hôte, la contiguïté et la
+   durabilité de l’ordre sont caractérisées.
 4. **Reconnexion ancienne** — vérifier la convergence sur un suffixe important.
 5. **Pression et backpressure** — mesurer les bornes après stabilisation des
    sémantiques précédentes.
 
-Les deux premières familles protègent maintenant l’intégrité du journal
-canonique. La concurrence est la prochaine expérience ; la reconnexion
-ancienne et la pression restent différées jusqu’à stabilisation de son ordre.
+Les trois premières familles protègent maintenant l’identité, la récupération
+et l’ordre du journal canonique. La reconnexion ancienne est la prochaine
+expérience ; la pression reste différée jusqu’à stabilisation du rattrapage.

@@ -298,7 +298,9 @@ expected revision, and payload.
 - `accepted_command_id_with_different_content_is_rejected_explicitly`;
 - `accepted_command_deduplication_survives_restart`;
 - `rejected_command_id_can_be_reevaluated`;
-- `host_loads_legacy_events_and_appends_versioned_acceptances`.
+- `host_loads_legacy_events_and_appends_versioned_acceptances`;
+- `concurrent_identical_command_is_appended_once_and_replayed_to_both_callers`;
+- `concurrent_command_id_collision_has_one_winner_and_one_explicit_rejection`.
 
 **Reproducible breaking attempt.** Submit a command, retain its request and
 events, restart the host, then resubmit exactly the same request. Revision and
@@ -312,13 +314,17 @@ return `command_id_collision`.
 
 **Exact statement.** Within one V0.2 host process, session and activity
 commands that reach `Host::join` or `Host::submit` are handled one at a time
-under the same canonical lock. Every accepted command observes one revision and
-records its events in a unique total order.
+under the same canonical lock. Decision, prospective validation, durable
+append, memory commit, and batch emission cannot interleave with another
+command. Events belonging to one receipt remain atomic and contiguous. The
+accepted-command order in the journal is the only canonical order.
 
 **Assumptions and scope.** There is one authoritative process and one `Host`
 instance. Lock acquisition order among concurrent commands is not predetermined
-and need not be identical across runs. Only the order eventually recorded in
-the journal is canonical and reproducible through replay.
+and need not be identical across runs. The guarantee covers neither network
+arrival order, global temporal order, fairness, nor absence of starvation. A
+slow activity decision delays later commands. Only the order eventually
+synchronized in the journal is canonical and reproducible through replay.
 
 **Enforcement point.**
 
@@ -328,21 +334,39 @@ the journal is canonical and reproducible through replay.
 - validation, persistence, and commit remain under that guard through
   [`Host::commit`](../crates/sytog-node/src/lib.rs#L643-L710).
 
-**Behavior under concurrency.** One command wins the lock and may be accepted.
-Another carrying the same `expected_revision` is then rejected with
-`revision_conflict`. There is no merge or distributed ordering among several
-authorities.
+**Behavior under concurrency.**
+
+- two distinct commands at one revision: the first accepted command advances
+  the revision; the other is rejected with `revision_conflict`;
+- the same accepted command submitted twice: one append and the same result
+  for both callers under INV-007;
+- same `message_id` with different content: one possible acceptance followed
+  by `command_id_collision`;
+- closing a connection does not cancel a command whose durable append
+  succeeded;
+- a burst loses no internal outcome: every submission observed by the host
+  becomes success, duplicate, or a structured rejection. A disconnected
+  client may not receive that outcome and must resume through deduplication or
+  catch-up.
+
+There is no merge or distributed ordering among several authorities.
 
 **Existing tests.**
 
-- `sytog_node::tests::two_participants_converge_and_catch_up_from_the_journal`
-  verifies rejection of a stale revision;
-- no test currently issues several submissions truly simultaneously.
+- `concurrent_distinct_commands_at_one_revision_are_linearized`;
+- `concurrent_identical_command_is_appended_once_and_replayed_to_both_callers`;
+- `concurrent_command_id_collision_has_one_winner_and_one_explicit_rejection`;
+- `slow_command_holds_its_place_without_partial_interleaving`;
+- `separate_connections_share_one_canonical_order_and_catch_up_state`;
+- `disconnect_during_acceptance_does_not_erase_a_durable_command`;
+- `concurrent_burst_accounts_for_every_command_without_history_gaps`;
+- `concurrent_order_and_receipts_survive_restart_and_replay`.
 
-**Reproducible breaking attempt.** Open ten connections, give them the same
-latest revision, then release ten valid commands simultaneously. Verify that
-one contiguous order appears in the journal, stale losers receive structured
-rejections, and replay reproduces that order.
+**Reproducible breaking attempt.** Open several connections, release them
+simultaneously at one revision, artificially delay one decision, then close a
+connection while it is handled. Check sequences, `event_id` values, physical
+V1 receipts, multi-event contiguity, responses, broadcast, and catch-up.
+Restart and compare state, events, and the receipt index exactly.
 
 ### INV-013 — Persistence before memory commit and broadcast
 
@@ -368,7 +392,11 @@ prevents memory commit and broadcast. If the write left an unterminated final
 suffix, the next restart applies INV-009 after validating the prefix.
 
 **Existing tests.** Deduplication-after-restart and mixed V0/V1 journal tests
-cover the successful path. No test yet injects a crash or error at every append
+cover the successful path.
+`disconnect_during_acceptance_does_not_erase_a_durable_command` demonstrates
+that connection loss does not remove an accepted fact.
+`concurrent_order_and_receipts_survive_restart_and_replay` compares history
+before and after restart. No test yet injects a crash or error at every append
 point.
 
 **Reproducible breaking attempt.** Use an instrumented storage adapter that
@@ -406,6 +434,9 @@ or hash comparison with the host currently detects silent divergence.
 
 - `sytog_node::tests::two_participants_converge_and_catch_up_from_the_journal`
   exercises two participants and an event suffix;
+- `separate_connections_share_one_canonical_order_and_catch_up_state`
+  exercises two concurrent WebSocket submissions followed by two fresh
+  replicas catching up from sequence zero;
 - the manual V0.2 path produced host, Alice, and Bob snapshots that were
   semantically and byte-for-byte equal with the same implementation.
 
@@ -489,7 +520,9 @@ sent, and no strategy if the suffix is no longer available.
 **Existing tests and experiments.**
 
 - `two_participants_converge_and_catch_up_from_the_journal` verifies
-  `events_after(3)` but not a complete WebSocket reconnection;
+  `events_after(3)`;
+- `separate_connections_share_one_canonical_order_and_catch_up_state`
+  verifies a WebSocket `Hello` from zero and convergence of two fresh replicas;
 - reconnecting a lagging client and restarting the host were checked manually
   during V0.2.
 
@@ -541,12 +574,12 @@ batches.
    durable idempotence are now defined.
 2. **JSONL corruption — complete**: the commit boundary and incomplete-suffix
    recovery are now defined.
-3. **Concurrency — next**: exercise canonical ordering once history is
-   reliable.
+3. **Concurrency — complete**: single-host linearization, contiguity, and order
+   durability are characterized.
 4. **Old reconnection** — verify convergence over a large suffix.
 5. **Pressure and backpressure** — measure bounds after the previous semantics
    are stable.
 
-The first two families now protect canonical-journal integrity. Concurrency is
-the next experiment; old reconnection and pressure remain deferred until its
-ordering semantics are stable.
+The first three families now protect canonical-journal identity, recovery, and
+ordering. Old reconnection is the next experiment; pressure remains deferred
+until catch-up behavior is stable.
