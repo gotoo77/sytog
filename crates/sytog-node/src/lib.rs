@@ -3,7 +3,7 @@
 use std::{
     collections::BTreeMap,
     fs::{self, OpenOptions},
-    io::{BufRead, BufReader, Write},
+    io::Write,
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::Arc,
@@ -116,6 +116,13 @@ struct AcceptedBatchV1 {
 struct LoadedJournal {
     events: Vec<SessionEvent>,
     accepted_commands: BTreeMap<MessageId, AcceptedCommandV1>,
+    recovery: Option<JournalRecovery>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct JournalRecovery {
+    safe_offset: u64,
+    original_length: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -476,6 +483,9 @@ impl Host {
         let journal = JournalStore::new(&config.data_dir, &config.session_id);
         let loaded = journal.load()?;
         let (state, events, accepted_commands) = if loaded.events.is_empty() {
+            if let Some(recovery) = &loaded.recovery {
+                journal.apply_recovery(recovery)?;
+            }
             let mut state = SessionState::uninitialized(config.session_id.clone());
             let request = CommandRequest {
                 message_id: MessageId::from("bootstrap"),
@@ -508,6 +518,9 @@ impl Host {
                 events: loaded.events.clone(),
             };
             let state = replay_log(SessionState::uninitialized(config.session_id.clone()), &log)?;
+            if let Some(recovery) = &loaded.recovery {
+                journal.apply_recovery(recovery)?;
+            }
             (state, loaded.events, loaded.accepted_commands)
         };
         let (sender, _) = broadcast::channel(256);
@@ -729,19 +742,54 @@ impl JournalStore {
             return Ok(LoadedJournal {
                 events: Vec::new(),
                 accepted_commands: BTreeMap::new(),
+                recovery: None,
             });
         }
-        let file = fs::File::open(path)?;
+        let bytes = fs::read(&path)?;
+        let original_length =
+            u64::try_from(bytes.len()).map_err(|_| NodeError::JournalOffsetOverflow)?;
+        let (complete, recovery) = if bytes.last().is_some_and(|byte| *byte != b'\n') {
+            let safe_length = bytes
+                .iter()
+                .rposition(|byte| *byte == b'\n')
+                .map_or(0, |offset| offset + 1);
+            (
+                &bytes[..safe_length],
+                Some(JournalRecovery {
+                    safe_offset: u64::try_from(safe_length)
+                        .map_err(|_| NodeError::JournalOffsetOverflow)?,
+                    original_length,
+                }),
+            )
+        } else {
+            (bytes.as_slice(), None)
+        };
         let mut events = Vec::new();
         let mut accepted_commands = BTreeMap::new();
-        for line in BufReader::new(file).lines() {
-            let line = line?;
-            if line.trim().is_empty() {
+        let mut line_offset = 0_usize;
+        for line in complete.split_inclusive(|byte| *byte == b'\n') {
+            let content = &line[..line.len().saturating_sub(1)];
+            let current_offset =
+                u64::try_from(line_offset).map_err(|_| NodeError::JournalOffsetOverflow)?;
+            line_offset = line_offset
+                .checked_add(line.len())
+                .ok_or(NodeError::JournalOffsetOverflow)?;
+            if content.iter().all(u8::is_ascii_whitespace) {
                 continue;
             }
-            let value: Value = serde_json::from_str(&line)?;
+            let value: Value = serde_json::from_slice(content).map_err(|source| {
+                NodeError::InvalidJournalLine {
+                    offset: current_offset,
+                    source,
+                }
+            })?;
             if value.get("record_type").is_some() {
-                let batch: AcceptedBatchV1 = serde_json::from_value(value)?;
+                let batch: AcceptedBatchV1 = serde_json::from_value(value).map_err(|source| {
+                    NodeError::InvalidJournalLine {
+                        offset: current_offset,
+                        source,
+                    }
+                })?;
                 if batch.record_type != "accepted_commands" {
                     return Err(NodeError::UnknownJournalRecord(batch.record_type));
                 }
@@ -774,13 +822,40 @@ impl JournalStore {
                     events.extend(accepted.events);
                 }
             } else {
-                events.push(serde_json::from_value(value)?);
+                events.push(serde_json::from_value(value).map_err(|source| {
+                    NodeError::InvalidJournalLine {
+                        offset: current_offset,
+                        source,
+                    }
+                })?);
             }
         }
         Ok(LoadedJournal {
             events,
             accepted_commands,
+            recovery,
         })
+    }
+
+    fn apply_recovery(&self, recovery: &JournalRecovery) -> Result<(), NodeError> {
+        let path = self.events_path();
+        let file = OpenOptions::new().read(true).write(true).open(&path)?;
+        let actual_length = file.metadata()?.len();
+        if actual_length != recovery.original_length {
+            return Err(NodeError::JournalChangedDuringRecovery {
+                expected: recovery.original_length,
+                actual: actual_length,
+            });
+        }
+        file.set_len(recovery.safe_offset)?;
+        file.sync_data()?;
+        eprintln!(
+            "journal recovery: truncated incomplete suffix in {} from byte {} to safe offset {}",
+            path.display(),
+            recovery.original_length,
+            recovery.safe_offset
+        );
+        Ok(())
     }
 
     fn append_accepted(&self, commands: &[AcceptedCommandV1]) -> Result<(), NodeError> {
@@ -1127,6 +1202,16 @@ pub enum NodeError {
     Apply(#[from] sytog_domain::ApplyError),
     #[error(transparent)]
     Protocol(#[from] sytog_protocol::ProtocolError),
+    #[error("journal byte offset overflow")]
+    JournalOffsetOverflow,
+    #[error("invalid journal line at byte offset {offset}: {source}")]
+    InvalidJournalLine {
+        offset: u64,
+        #[source]
+        source: serde_json::Error,
+    },
+    #[error("journal changed during recovery: expected length {expected}, actual length {actual}")]
+    JournalChangedDuringRecovery { expected: u64, actual: u64 },
     #[error("invalid session directory")]
     InvalidSessionPath,
     #[error("unsupported accepted-command batch schema version: {0}")]
@@ -1193,6 +1278,97 @@ mod tests {
                 display_name: display_name.to_owned(),
             }),
         }
+    }
+
+    fn server_config(name: &str) -> (PathBuf, ServerConfig) {
+        let directory = temporary_directory(name);
+        if directory.exists() {
+            fs::remove_dir_all(&directory).expect("old test directory can be removed");
+        }
+        let config = ServerConfig {
+            bind: "127.0.0.1:0".to_owned(),
+            data_dir: directory.clone(),
+            session_id: SessionId::from(name),
+        };
+        (directory, config)
+    }
+
+    async fn create_versioned_vote(
+        name: &str,
+        include_vote: bool,
+    ) -> (PathBuf, ServerConfig, CommandRequest) {
+        let (directory, config) = server_config(name);
+        let host = Host::load_or_create(&config, Arc::new(VoteActivity)).expect("host bootstraps");
+        host.join(
+            ParticipantId::from("alice"),
+            "Alice".to_owned(),
+            MessageId::from("join-alice"),
+        )
+        .await
+        .expect("Alice joins");
+        let open = CommandRequest {
+            message_id: MessageId::from("open-vote"),
+            actor: ParticipantId::from("alice"),
+            expected_revision: 2,
+            command: Command::Activity(VoteActivity::open(&["tea", "coffee"])),
+        };
+        host.submit(open.clone()).await.expect("vote opens");
+        if include_vote {
+            host.submit(CommandRequest {
+                message_id: MessageId::from("vote-once"),
+                actor: ParticipantId::from("alice"),
+                expected_revision: 4,
+                command: Command::Activity(VoteActivity::submit("tea")),
+            })
+            .await
+            .expect("vote is accepted");
+        }
+        drop(host);
+        (directory, config, open)
+    }
+
+    fn journal_path(config: &ServerConfig) -> PathBuf {
+        JournalStore::new(&config.data_dir, &config.session_id).events_path()
+    }
+
+    fn last_record_start(bytes: &[u8]) -> usize {
+        assert_eq!(bytes.last(), Some(&b'\n'), "journal ends with newline");
+        bytes[..bytes.len() - 1]
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+            .map_or(0, |offset| offset + 1)
+    }
+
+    fn write_legacy_two_event_journal(config: &ServerConfig) -> usize {
+        let journal = JournalStore::new(&config.data_dir, &config.session_id);
+        fs::create_dir_all(&journal.directory).expect("journal directory is created");
+        let mut state = SessionState::uninitialized(config.session_id.clone());
+        let create = CommandRequest {
+            message_id: MessageId::from("legacy-create"),
+            actor: ParticipantId::from(HOST_ID),
+            expected_revision: 0,
+            command: Command::Session(SessionCommand::CreateSession {
+                display_name: "Legacy Host".to_owned(),
+            }),
+        };
+        let first =
+            sytog_runtime::execute(&mut state, &create, None).expect("legacy create succeeds");
+        let join = CommandRequest {
+            message_id: MessageId::from("legacy-join"),
+            actor: ParticipantId::from("alice"),
+            expected_revision: 1,
+            command: Command::Session(SessionCommand::Join {
+                display_name: "Alice".to_owned(),
+            }),
+        };
+        let second = sytog_runtime::execute(&mut state, &join, None).expect("legacy join succeeds");
+        let mut bytes = serde_json::to_vec(&first.events[0]).expect("first event serializes");
+        bytes.push(b'\n');
+        let safe_offset = bytes.len();
+        bytes.extend(serde_json::to_vec(&second.events[0]).expect("second event serializes"));
+        bytes.push(b'\n');
+        fs::write(journal.events_path(), bytes).expect("legacy journal is written");
+        safe_offset
     }
 
     #[test]
@@ -1597,6 +1773,223 @@ mod tests {
             .await
             .expect("a rejected identifier is not retained");
         assert_eq!(restarted.current_revision().await, 4);
+        fs::remove_dir_all(directory).expect("test directory can be removed");
+    }
+
+    #[test]
+    fn truncated_legacy_final_line_recovers_valid_prefix() {
+        let (directory, config) = server_config("truncated-legacy-final");
+        let safe_offset = write_legacy_two_event_journal(&config);
+        let path = journal_path(&config);
+        let bytes = fs::read(&path).expect("journal is readable");
+        fs::write(&path, &bytes[..safe_offset + 12]).expect("last line is truncated");
+
+        let restarted = Host::load_or_create(&config, Arc::new(VoteActivity))
+            .expect("valid legacy prefix is recovered");
+        assert_eq!(restarted.canonical.blocking_lock().state.revision, 1);
+        assert_eq!(
+            fs::metadata(&path).expect("journal metadata").len(),
+            u64::try_from(safe_offset).expect("offset fits")
+        );
+        fs::remove_dir_all(directory).expect("test directory can be removed");
+    }
+
+    #[test]
+    fn invalid_final_bytes_recover_valid_prefix() {
+        let (directory, config) = server_config("invalid-final-bytes");
+        let host = Host::load_or_create(&config, Arc::new(VoteActivity)).expect("host bootstraps");
+        let revision = host.canonical.blocking_lock().state.revision;
+        drop(host);
+        let path = journal_path(&config);
+        let safe_offset = fs::metadata(&path).expect("journal metadata").len();
+        OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("journal opens")
+            .write_all(&[0xff, 0xfe, 0xfd])
+            .expect("invalid suffix is appended");
+
+        let restarted = Host::load_or_create(&config, Arc::new(VoteActivity))
+            .expect("invalid unterminated suffix is recovered");
+        assert_eq!(restarted.canonical.blocking_lock().state.revision, revision);
+        assert_eq!(
+            fs::metadata(&path).expect("journal metadata").len(),
+            safe_offset
+        );
+        fs::remove_dir_all(directory).expect("test directory can be removed");
+    }
+
+    #[test]
+    fn terminated_invalid_final_line_fails_without_repair() {
+        let (directory, config) = server_config("terminated-invalid-final-line");
+        let host = Host::load_or_create(&config, Arc::new(VoteActivity)).expect("host bootstraps");
+        drop(host);
+        let path = journal_path(&config);
+        OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("journal opens")
+            .write_all(&[0xff, 0xfe, b'\n'])
+            .expect("terminated invalid line is appended");
+        let corrupted = fs::read(&path).expect("journal is readable");
+
+        assert!(Host::load_or_create(&config, Arc::new(VoteActivity)).is_err());
+        assert_eq!(
+            fs::read(&path).expect("journal is readable"),
+            corrupted,
+            "a terminated invalid line is corruption, not a partial append"
+        );
+        fs::remove_dir_all(directory).expect("test directory can be removed");
+    }
+
+    #[test]
+    fn final_empty_line_is_valid_and_unchanged() {
+        let (directory, config) = server_config("final-empty-line");
+        let host = Host::load_or_create(&config, Arc::new(VoteActivity)).expect("host bootstraps");
+        let revision = host.canonical.blocking_lock().state.revision;
+        drop(host);
+        let path = journal_path(&config);
+        OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("journal opens")
+            .write_all(b"\n")
+            .expect("empty line is appended");
+        let before = fs::read(&path).expect("journal is readable");
+
+        let restarted =
+            Host::load_or_create(&config, Arc::new(VoteActivity)).expect("empty line is valid");
+        assert_eq!(restarted.canonical.blocking_lock().state.revision, revision);
+        assert_eq!(fs::read(&path).expect("journal is readable"), before);
+        fs::remove_dir_all(directory).expect("test directory can be removed");
+    }
+
+    #[tokio::test]
+    async fn syntactic_corruption_in_the_middle_fails_without_repair() {
+        let (directory, config, _) = create_versioned_vote("middle-syntax-corruption", false).await;
+        let path = journal_path(&config);
+        let bytes = fs::read(&path).expect("journal is readable");
+        let first_end = bytes
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .expect("first line ends");
+        let second_end = bytes[first_end + 1..]
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map(|offset| first_end + 1 + offset)
+            .expect("second line ends");
+        let mut corrupted = bytes[..=first_end].to_vec();
+        corrupted.extend_from_slice(b"not-json\n");
+        corrupted.extend_from_slice(&bytes[second_end + 1..]);
+        fs::write(&path, &corrupted).expect("middle line is corrupted");
+
+        assert!(Host::load_or_create(&config, Arc::new(VoteActivity)).is_err());
+        assert_eq!(
+            fs::read(&path).expect("journal is readable"),
+            corrupted,
+            "middle corruption must not be repaired"
+        );
+        fs::remove_dir_all(directory).expect("test directory can be removed");
+    }
+
+    #[tokio::test]
+    async fn semantic_corruption_fails_without_repair() {
+        let (directory, config, _) = create_versioned_vote("semantic-corruption", false).await;
+        let path = journal_path(&config);
+        let bytes = fs::read(&path).expect("journal is readable");
+        let mut lines: Vec<Value> = bytes
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_slice(line).expect("line is valid JSON"))
+            .collect();
+        lines[1]["commands"][0]["events"][0]["sequence"] = Value::from(99);
+        let mut corrupted = Vec::new();
+        for line in lines {
+            serde_json::to_writer(&mut corrupted, &line).expect("line serializes");
+            corrupted.push(b'\n');
+        }
+        corrupted.extend_from_slice(b"{\"incomplete\":");
+        fs::write(&path, &corrupted).expect("semantic corruption is written");
+
+        assert!(Host::load_or_create(&config, Arc::new(VoteActivity)).is_err());
+        assert_eq!(
+            fs::read(&path).expect("journal is readable"),
+            corrupted,
+            "semantic corruption must not be repaired"
+        );
+        fs::remove_dir_all(directory).expect("test directory can be removed");
+    }
+
+    #[tokio::test]
+    async fn truncated_v1_receipt_recovers_once() {
+        let (directory, config, _) = create_versioned_vote("truncated-v1-receipt", false).await;
+        let path = journal_path(&config);
+        let safe_offset = fs::metadata(&path).expect("journal metadata").len();
+        OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("journal opens")
+            .write_all(b"{\"record_type\":\"accepted_commands\",\"schema_version\":1")
+            .expect("partial receipt is appended");
+        let pending = JournalStore::new(&config.data_dir, &config.session_id)
+            .load()
+            .expect("valid prefix is inspectable")
+            .recovery
+            .expect("recovery diagnostic is explicit");
+        assert_eq!(pending.safe_offset, safe_offset);
+        assert_eq!(
+            pending.original_length,
+            fs::metadata(&path).expect("journal metadata").len()
+        );
+
+        let first = Host::load_or_create(&config, Arc::new(VoteActivity))
+            .expect("partial receipt is recovered");
+        assert_eq!(first.current_revision().await, 4);
+        drop(first);
+        assert_eq!(
+            fs::metadata(&path).expect("journal metadata").len(),
+            safe_offset
+        );
+        let recovered = fs::read(&path).expect("recovered journal is readable");
+
+        let second = Host::load_or_create(&config, Arc::new(VoteActivity))
+            .expect("second restart is idempotent");
+        assert_eq!(second.current_revision().await, 4);
+        assert_eq!(fs::read(&path).expect("journal is readable"), recovered);
+        fs::remove_dir_all(directory).expect("test directory can be removed");
+    }
+
+    #[tokio::test]
+    async fn truncated_v1_event_preserves_prior_command_deduplication() {
+        let (directory, config, open) = create_versioned_vote("truncated-v1-event", true).await;
+        let path = journal_path(&config);
+        let bytes = fs::read(&path).expect("journal is readable");
+        let last_start = last_record_start(&bytes);
+        let event_marker = bytes[last_start..]
+            .windows(b"\"events\":[".len())
+            .position(|window| window == b"\"events\":[")
+            .map(|offset| last_start + offset)
+            .expect("last receipt contains events");
+        let cut = event_marker + b"\"events\":[".len() + 24;
+        fs::write(&path, &bytes[..cut]).expect("event payload is truncated");
+
+        let restarted = Host::load_or_create(&config, Arc::new(VoteActivity))
+            .expect("partial final event is recovered");
+        assert_eq!(restarted.current_revision().await, 4);
+        let duplicate = restarted
+            .submit(open)
+            .await
+            .expect("prior accepted command remains deduplicated");
+        assert!(duplicate.duplicate);
+        drop(restarted);
+        assert_eq!(
+            fs::metadata(&path).expect("journal metadata").len(),
+            u64::try_from(last_start).expect("offset fits")
+        );
+
+        let second = Host::load_or_create(&config, Arc::new(VoteActivity))
+            .expect("second restart remains valid");
+        assert_eq!(second.current_revision().await, 4);
         fs::remove_dir_all(directory).expect("test directory can be removed");
     }
 }
