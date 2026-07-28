@@ -1,6 +1,6 @@
 # ADR 0008: Overload and backpressure contract
 
-Status: proposed
+Status: accepted
 
 Implementation note: protocol slice 1 defines V2 vocabulary, validation,
 versioned decoding, stable overload reasons, and the observable close contract.

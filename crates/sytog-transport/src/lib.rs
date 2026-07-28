@@ -148,7 +148,7 @@ impl CatchUpPage {
         if self.events.is_empty() {
             return Err(CatchUpPageError::Empty);
         }
-        if metadata.from_sequence == 0 {
+        if metadata.earliest_available_sequence == 0 || metadata.from_sequence == 0 {
             return Err(CatchUpPageError::ZeroSequence);
         }
         if metadata.from_sequence > metadata.through_sequence {
@@ -617,6 +617,13 @@ mod tests {
             decode_versioned(&wrapped).expect("V1 dispatch remains supported"),
             VersionedNetworkMessage::V1(message)
         );
+        assert!(matches!(
+            decode_v2(&wrapped),
+            Err(TransportError::ProtocolVersionMismatch {
+                expected: PROTOCOL_VERSION_V2,
+                actual: PROTOCOL_VERSION_V1,
+            })
+        ));
     }
 
     #[test]
@@ -809,6 +816,82 @@ mod tests {
             events: vec![event(0)],
         };
         assert_eq!(zero.validate(), Err(CatchUpPageError::ZeroSequence));
+
+        let zero_earliest = CatchUpPage {
+            metadata: CatchUpPageMetadata {
+                earliest_available_sequence: 0,
+                from_sequence: 1,
+                through_sequence: 1,
+                current_sequence: 1,
+                snapshot_revision: None,
+                terminal: true,
+            },
+            events: vec![event(1)],
+        };
+        assert_eq!(
+            zero_earliest.validate(),
+            Err(CatchUpPageError::ZeroSequence)
+        );
+    }
+
+    #[test]
+    fn catch_up_page_rejects_incoherent_availability_and_range_bounds() {
+        let earliest_after_start = CatchUpPage {
+            metadata: CatchUpPageMetadata {
+                earliest_available_sequence: 3,
+                from_sequence: 2,
+                through_sequence: 2,
+                current_sequence: 2,
+                snapshot_revision: None,
+                terminal: true,
+            },
+            events: vec![event(2)],
+        };
+        assert!(matches!(
+            earliest_after_start.validate(),
+            Err(CatchUpPageError::EarliestAfterStart {
+                earliest: 3,
+                from: 2,
+            })
+        ));
+
+        let beyond_current = CatchUpPage {
+            metadata: CatchUpPageMetadata {
+                earliest_available_sequence: 1,
+                from_sequence: 3,
+                through_sequence: 4,
+                current_sequence: 3,
+                snapshot_revision: None,
+                terminal: false,
+            },
+            events: vec![event(3), event(4)],
+        };
+        assert!(matches!(
+            beyond_current.validate(),
+            Err(CatchUpPageError::BeyondCurrent {
+                through: 4,
+                current: 3,
+            })
+        ));
+
+        let range_end_mismatch = CatchUpPage {
+            metadata: CatchUpPageMetadata {
+                earliest_available_sequence: 1,
+                from_sequence: 2,
+                through_sequence: 4,
+                current_sequence: 5,
+                snapshot_revision: None,
+                terminal: false,
+            },
+            events: vec![event(2), event(3)],
+        };
+        assert!(matches!(
+            range_end_mismatch.validate(),
+            Err(CatchUpPageError::RangeEndMismatch {
+                expected: 4,
+                actual: 3,
+            })
+        ));
     }
 
     #[test]
@@ -904,6 +987,11 @@ mod tests {
             "server_overloaded"
         );
         assert_eq!(AdmissionRejectionReason::ServerOverloaded.code(), 4201);
+        assert_eq!(
+            serde_json::to_value(AdmissionRejectionReason::ServerOverloaded)
+                .expect("admission rejection reason serializes"),
+            serde_json::Value::String("server_overloaded".to_owned())
+        );
         assert_eq!(RESYNC_REQUIRED_CLOSE_CODE, 4001);
         assert_eq!(RESYNC_REQUIRED_CLOSE_REASON, "resync_required");
     }
