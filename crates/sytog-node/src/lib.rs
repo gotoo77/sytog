@@ -1,6 +1,7 @@
 //! Authoritative local-network node with JSONL durability.
 
 use std::{
+    collections::BTreeMap,
     fs::{self, OpenOptions},
     io::{BufRead, BufReader, Write},
     net::SocketAddr,
@@ -10,6 +11,7 @@ use std::{
 
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sytog_domain::{
     ActivityCommandEnvelope, Command, CommandRequest, MessageId, ParticipantId, SessionCommand,
     SessionEvent, SessionId, SessionState,
@@ -29,6 +31,30 @@ use tokio::{
 use tokio_tungstenite::accept_async;
 
 const HOST_ID: &str = "host";
+const ACCEPTED_BATCH_SCHEMA_VERSION: u16 = 1;
+const CLIENT_REPLICA_SCHEMA_VERSION: u16 = 1;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReceivedEvent {
+    Applied,
+    AlreadySeen,
+    Gap,
+}
+
+#[derive(Clone, Debug)]
+struct ClientReplica {
+    state: SessionState,
+    history_base_revision: u64,
+    events: BTreeMap<u64, SessionEvent>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ClientReplicaV1 {
+    schema_version: u16,
+    history_base_revision: u64,
+    snapshot: SnapshotV0,
+    events: Vec<SessionEvent>,
+}
 
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
@@ -49,6 +75,7 @@ pub struct ClientConfig {
 struct CanonicalSession {
     state: SessionState,
     events: Vec<SessionEvent>,
+    accepted_commands: BTreeMap<MessageId, AcceptedCommandV1>,
 }
 
 struct Host {
@@ -70,6 +97,31 @@ struct SessionMetadata {
     protocol_version: u16,
     session_id: SessionId,
     authority_id: ParticipantId,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct AcceptedCommandV1 {
+    request: CommandRequest,
+    events: Vec<SessionEvent>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct AcceptedBatchV1 {
+    record_type: String,
+    schema_version: u16,
+    commands: Vec<AcceptedCommandV1>,
+}
+
+#[derive(Debug)]
+struct LoadedJournal {
+    events: Vec<SessionEvent>,
+    accepted_commands: BTreeMap<MessageId, AcceptedCommandV1>,
+}
+
+#[derive(Clone, Debug)]
+struct Submission {
+    events: Vec<SessionEvent>,
+    duplicate: bool,
 }
 
 /// Runs an authoritative WebSocket host until Ctrl-C.
@@ -126,16 +178,16 @@ pub async fn connect_client(
 ) -> Result<(), NodeError> {
     let socket = sytog_transport::connect(&config.url).await?;
     let (mut sink, mut stream) = socket.split();
-    let mut local = load_client_state(&config)?;
+    let mut local = load_client_replica(&config)?;
     let mut outgoing_counter = 0_u64;
 
     send_client_message(
         &mut sink,
         &config,
         next_message_id(&config.participant_id, &mut outgoing_counter),
-        local.revision,
+        local.state.revision,
         &NetworkMessage::Hello {
-            last_sequence: local.revision,
+            last_sequence: local.state.revision,
         },
     )
     .await?;
@@ -143,7 +195,7 @@ pub async fn connect_client(
         &mut sink,
         &config,
         next_message_id(&config.participant_id, &mut outgoing_counter),
-        local.revision,
+        local.state.revision,
         &NetworkMessage::JoinSession {
             display_name: config.participant_id.0.clone(),
         },
@@ -152,7 +204,7 @@ pub async fn connect_client(
 
     println!(
         "connected as {} at local revision {}",
-        config.participant_id.0, local.revision
+        config.participant_id.0, local.state.revision
     );
     println!("commands: activity command | state | quit");
     let stdin = AsyncBufReader::new(tokio::io::stdin());
@@ -171,26 +223,26 @@ pub async fn connect_client(
                     return Ok(());
                 }
                 if line == "state" {
-                    println!("{}", serde_json::to_string_pretty(&local)?);
+                    println!("{}", serde_json::to_string_pretty(&local.state)?);
                     continue;
                 }
                 match parse_command(line) {
                     Ok(command) => {
                         let message_id = MessageId(format!(
                             "{}:command:{}",
-                            config.participant_id.0, local.revision
+                            config.participant_id.0, local.state.revision
                         ));
                         let request = CommandRequest {
                             message_id: message_id.clone(),
                             actor: config.participant_id.clone(),
-                            expected_revision: local.revision,
+                            expected_revision: local.state.revision,
                             command: Command::Activity(command),
                         };
                         send_client_message(
                             &mut sink,
                             &config,
                             message_id,
-                            local.revision,
+                            local.state.revision,
                             &NetworkMessage::SubmitCommand { request },
                         )
                         .await?;
@@ -205,28 +257,29 @@ pub async fn connect_client(
                     NetworkMessage::EventBatch { events, .. } => {
                         let mut gap = false;
                         for event in events {
-                            if event.sequence <= local.revision {
-                                continue;
+                            match local.apply_received_event(&event)? {
+                                ReceivedEvent::Applied => {
+                                    println!(
+                                        "event {} sequence={} revision={}",
+                                        event.event_id.0, event.sequence, local.state.revision
+                                    );
+                                }
+                                ReceivedEvent::AlreadySeen => {}
+                                ReceivedEvent::Gap => {
+                                    gap = true;
+                                    break;
+                                }
                             }
-                            if event.sequence != local.revision + 1 {
-                                gap = true;
-                                break;
-                            }
-                            local.apply(&event)?;
-                            println!(
-                                "event {} sequence={} revision={}",
-                                event.event_id.0, event.sequence, local.revision
-                            );
                         }
-                        save_client_state(&config, &local)?;
+                        save_client_replica(&config, &local)?;
                         if gap {
                             send_client_message(
                                 &mut sink,
                                 &config,
                                 next_message_id(&config.participant_id, &mut outgoing_counter),
-                                local.revision,
+                                local.state.revision,
                                 &NetworkMessage::CatchUpRequest {
-                                    after_sequence: local.revision,
+                                    after_sequence: local.state.revision,
                                 },
                             )
                             .await?;
@@ -235,9 +288,9 @@ pub async fn connect_client(
                     NetworkMessage::StateSnapshot { snapshot } => {
                         snapshot.validate()?;
                         ensure_session(&snapshot.session_id, &config.session_id)?;
-                        local = snapshot.state;
-                        save_client_state(&config, &local)?;
-                        println!("snapshot applied at revision {}", local.revision);
+                        local = ClientReplica::from_snapshot(snapshot);
+                        save_client_replica(&config, &local)?;
+                        println!("snapshot applied at revision {}", local.state.revision);
                     }
                     NetworkMessage::CommandRejected {
                         code,
@@ -248,14 +301,14 @@ pub async fn connect_client(
                         eprintln!(
                             "command rejected: code={code} detail={detail} current_revision={current_revision}"
                         );
-                        if current_revision > local.revision {
+                        if current_revision > local.state.revision {
                             send_client_message(
                                 &mut sink,
                                 &config,
                                 next_message_id(&config.participant_id, &mut outgoing_counter),
-                                local.revision,
+                                local.state.revision,
                                 &NetworkMessage::CatchUpRequest {
-                                    after_sequence: local.revision,
+                                    after_sequence: local.state.revision,
                                 },
                             )
                             .await?;
@@ -337,8 +390,29 @@ async fn handle_connection(
                             ).await?;
                             continue;
                         }
-                        if let Err(rejection) = host.submit(request).await {
-                            send_rejection(&mut sink, &host, message_id, rejection).await?;
+                        match host.submit(request).await {
+                            Ok(submission) if submission.duplicate => {
+                                if let (Some(first), Some(last)) =
+                                    (submission.events.first(), submission.events.last())
+                                {
+                                    let from_sequence = first.sequence;
+                                    let revision = last.sequence;
+                                    send_host_message(
+                                        &mut sink,
+                                        &host.session_id,
+                                        &NetworkMessage::EventBatch {
+                                            from_sequence,
+                                            events: submission.events,
+                                        },
+                                        revision,
+                                    )
+                                    .await?;
+                                }
+                            }
+                            Ok(_) => {}
+                            Err(rejection) => {
+                                send_rejection(&mut sink, &host, message_id, rejection).await?;
+                            }
                         }
                     }
                     NetworkMessage::CatchUpRequest { after_sequence } => {
@@ -400,8 +474,8 @@ impl Host {
         activity: Arc<dyn ActivityEngine + Send + Sync>,
     ) -> Result<Self, NodeError> {
         let journal = JournalStore::new(&config.data_dir, &config.session_id);
-        let existing = journal.load_events()?;
-        let (state, events) = if existing.is_empty() {
+        let loaded = journal.load()?;
+        let (state, events, accepted_commands) = if loaded.events.is_empty() {
             let mut state = SessionState::uninitialized(config.session_id.clone());
             let request = CommandRequest {
                 message_id: MessageId::from("bootstrap"),
@@ -412,10 +486,18 @@ impl Host {
                 }),
             };
             let decision = sytog_runtime::execute(&mut state, &request, None)?;
-            journal.append_events(&decision.events)?;
+            let accepted = AcceptedCommandV1 {
+                request,
+                events: decision.events.clone(),
+            };
+            journal.append_accepted(&[accepted.clone()])?;
             journal.write_metadata()?;
             journal.write_snapshot(&state)?;
-            (state, decision.events)
+            (
+                state,
+                decision.events,
+                BTreeMap::from([(accepted.request.message_id.clone(), accepted)]),
+            )
         } else {
             let log = EventLogV0 {
                 family: PROTOCOL_FAMILY.to_owned(),
@@ -423,17 +505,21 @@ impl Host {
                 schema_version: EVENT_LOG_SCHEMA_VERSION,
                 session_id: config.session_id.clone(),
                 base_revision: 0,
-                events: existing.clone(),
+                events: loaded.events.clone(),
             };
             let state = replay_log(SessionState::uninitialized(config.session_id.clone()), &log)?;
-            (state, existing)
+            (state, loaded.events, loaded.accepted_commands)
         };
         let (sender, _) = broadcast::channel(256);
         Ok(Self {
             session_id: config.session_id.clone(),
             activity,
             journal,
-            canonical: Mutex::new(CanonicalSession { state, events }),
+            canonical: Mutex::new(CanonicalSession {
+                state,
+                events,
+                accepted_commands,
+            }),
             events: sender,
         })
     }
@@ -454,11 +540,27 @@ impl Host {
             expected_revision: canonical.state.revision,
             command: Command::Session(SessionCommand::Join { display_name }),
         };
-        self.accept(&mut canonical, &request, None)
+        self.accept(&mut canonical, &request, None).map(|_| ())
     }
 
-    async fn submit(&self, request: CommandRequest) -> Result<(), HostRejection> {
+    async fn submit(&self, request: CommandRequest) -> Result<Submission, HostRejection> {
         let mut canonical = self.canonical.lock().await;
+        if let Some(accepted) = canonical.accepted_commands.get(&request.message_id) {
+            if accepted.request == request {
+                return Ok(Submission {
+                    events: accepted.events.clone(),
+                    duplicate: true,
+                });
+            }
+            return Err(HostRejection::new(
+                "command_id_collision",
+                format!(
+                    "message_id {} was already accepted with different command content",
+                    request.message_id.0
+                ),
+                canonical.state.revision,
+            ));
+        }
         if request.expected_revision != canonical.state.revision {
             let rejection = Rejection::RevisionConflict {
                 expected: canonical.state.revision,
@@ -471,6 +573,7 @@ impl Host {
         }
 
         if matches!(request.command, Command::Activity(_)) && canonical.state.activity.is_none() {
+            let original_request = request.clone();
             let start = CommandRequest {
                 message_id: MessageId(format!("auto-start:{}", request.message_id.0)),
                 actor: ParticipantId::from(HOST_ID),
@@ -493,11 +596,11 @@ impl Host {
             apply_decision_atomically(&mut candidate, &activity_decision).map_err(|error| {
                 HostRejection::new("apply_failed", error.to_string(), canonical.state.revision)
             })?;
-            return self.commit(
-                &mut canonical,
-                candidate,
-                [start_decision.events, activity_decision.events].concat(),
-            );
+            let activity_accepted = AcceptedCommandV1 {
+                request: original_request,
+                events: [start_decision.events, activity_decision.events].concat(),
+            };
+            return self.commit(&mut canonical, candidate, vec![activity_accepted]);
         }
         self.accept(&mut canonical, &request, Some(self.activity.as_ref()))
     }
@@ -507,22 +610,48 @@ impl Host {
         canonical: &mut CanonicalSession,
         request: &CommandRequest,
         activity: Option<&dyn ActivityEngine>,
-    ) -> Result<(), HostRejection> {
+    ) -> Result<Submission, HostRejection> {
         let decision = decide(&canonical.state, request, activity)
             .map_err(|error| HostRejection::from_runtime(&error, canonical.state.revision))?;
         let mut candidate = canonical.state.clone();
         apply_decision_atomically(&mut candidate, &decision).map_err(|error| {
             HostRejection::new("apply_failed", error.to_string(), canonical.state.revision)
         })?;
-        self.commit(canonical, candidate, decision.events)
+        self.commit(
+            canonical,
+            candidate,
+            vec![AcceptedCommandV1 {
+                request: request.clone(),
+                events: decision.events,
+            }],
+        )
     }
 
     fn commit(
         &self,
         canonical: &mut CanonicalSession,
         candidate: SessionState,
-        events: Vec<SessionEvent>,
-    ) -> Result<(), HostRejection> {
+        accepted_commands: Vec<AcceptedCommandV1>,
+    ) -> Result<Submission, HostRejection> {
+        for accepted in &accepted_commands {
+            if canonical
+                .accepted_commands
+                .contains_key(&accepted.request.message_id)
+            {
+                return Err(HostRejection::new(
+                    "command_id_collision",
+                    format!(
+                        "message_id {} already exists in the accepted-command index",
+                        accepted.request.message_id.0
+                    ),
+                    canonical.state.revision,
+                ));
+            }
+        }
+        let events: Vec<_> = accepted_commands
+            .iter()
+            .flat_map(|accepted| accepted.events.iter().cloned())
+            .collect();
         let mut prospective_events = canonical.events.clone();
         prospective_events.extend(events.clone());
         EventLogV0 {
@@ -541,20 +670,30 @@ impl Host {
                 canonical.state.revision,
             )
         })?;
-        self.journal.append_events(&events).map_err(|error| {
-            HostRejection::new(
-                "persistence_failed",
-                error.to_string(),
-                canonical.state.revision,
-            )
-        })?;
+        self.journal
+            .append_accepted(&accepted_commands)
+            .map_err(|error| {
+                HostRejection::new(
+                    "persistence_failed",
+                    error.to_string(),
+                    canonical.state.revision,
+                )
+            })?;
         canonical.state = candidate;
         canonical.events.extend(events.clone());
+        for accepted in accepted_commands {
+            canonical
+                .accepted_commands
+                .insert(accepted.request.message_id.clone(), accepted);
+        }
         if let Err(error) = self.journal.write_snapshot(&canonical.state) {
             eprintln!("snapshot update failed after durable journal commit: {error}");
         }
-        let _ = self.events.send(events);
-        Ok(())
+        let _ = self.events.send(events.clone());
+        Ok(Submission {
+            events,
+            duplicate: false,
+        })
     }
 
     async fn events_after(&self, sequence: u64) -> Vec<SessionEvent> {
@@ -584,29 +723,75 @@ impl JournalStore {
         self.directory.join("events.jsonl")
     }
 
-    fn load_events(&self) -> Result<Vec<SessionEvent>, NodeError> {
+    fn load(&self) -> Result<LoadedJournal, NodeError> {
         let path = self.events_path();
         if !path.exists() {
-            return Ok(Vec::new());
+            return Ok(LoadedJournal {
+                events: Vec::new(),
+                accepted_commands: BTreeMap::new(),
+            });
         }
         let file = fs::File::open(path)?;
-        BufReader::new(file)
-            .lines()
-            .filter(|line| line.as_ref().map_or(true, |line| !line.trim().is_empty()))
-            .map(|line| {
-                let line = line?;
-                serde_json::from_str(&line).map_err(NodeError::Json)
-            })
-            .collect()
+        let mut events = Vec::new();
+        let mut accepted_commands = BTreeMap::new();
+        for line in BufReader::new(file).lines() {
+            let line = line?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let value: Value = serde_json::from_str(&line)?;
+            if value.get("record_type").is_some() {
+                let batch: AcceptedBatchV1 = serde_json::from_value(value)?;
+                if batch.record_type != "accepted_commands" {
+                    return Err(NodeError::UnknownJournalRecord(batch.record_type));
+                }
+                if batch.schema_version != ACCEPTED_BATCH_SCHEMA_VERSION {
+                    return Err(NodeError::UnsupportedAcceptedBatchSchema(
+                        batch.schema_version,
+                    ));
+                }
+                if batch.commands.is_empty() {
+                    return Err(NodeError::EmptyAcceptedBatch);
+                }
+                for accepted in batch.commands {
+                    let message_id = accepted.request.message_id.clone();
+                    if accepted.events.is_empty() {
+                        return Err(NodeError::AcceptedCommandWithoutEvents(message_id.0));
+                    }
+                    if !accepted
+                        .events
+                        .iter()
+                        .any(|event| event.causation_id == message_id)
+                    {
+                        return Err(NodeError::AcceptedCommandMissingCausation(message_id.0));
+                    }
+                    if accepted_commands
+                        .insert(message_id.clone(), accepted.clone())
+                        .is_some()
+                    {
+                        return Err(NodeError::DuplicateAcceptedCommand(message_id.0));
+                    }
+                    events.extend(accepted.events);
+                }
+            } else {
+                events.push(serde_json::from_value(value)?);
+            }
+        }
+        Ok(LoadedJournal {
+            events,
+            accepted_commands,
+        })
     }
 
-    fn append_events(&self, events: &[SessionEvent]) -> Result<(), NodeError> {
+    fn append_accepted(&self, commands: &[AcceptedCommandV1]) -> Result<(), NodeError> {
         fs::create_dir_all(&self.directory)?;
-        let mut bytes = Vec::new();
-        for event in events {
-            serde_json::to_writer(&mut bytes, event)?;
-            bytes.push(b'\n');
-        }
+        let batch = AcceptedBatchV1 {
+            record_type: "accepted_commands".to_owned(),
+            schema_version: ACCEPTED_BATCH_SCHEMA_VERSION,
+            commands: commands.to_vec(),
+        };
+        let mut bytes = serde_json::to_vec(&batch)?;
+        bytes.push(b'\n');
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -646,6 +831,108 @@ impl JournalStore {
     }
 }
 
+impl ClientReplica {
+    fn uninitialized(session_id: SessionId) -> Self {
+        Self {
+            state: SessionState::uninitialized(session_id),
+            history_base_revision: 0,
+            events: BTreeMap::new(),
+        }
+    }
+
+    fn from_snapshot(snapshot: SnapshotV0) -> Self {
+        Self {
+            history_base_revision: snapshot.revision,
+            state: snapshot.state,
+            events: BTreeMap::new(),
+        }
+    }
+
+    fn from_v1(stored: ClientReplicaV1) -> Result<Self, NodeError> {
+        if stored.schema_version != CLIENT_REPLICA_SCHEMA_VERSION {
+            return Err(NodeError::UnsupportedClientReplicaSchema(
+                stored.schema_version,
+            ));
+        }
+        stored.snapshot.validate()?;
+        let log = EventLogV0 {
+            family: PROTOCOL_FAMILY.to_owned(),
+            protocol_version: PROTOCOL_VERSION,
+            schema_version: EVENT_LOG_SCHEMA_VERSION,
+            session_id: stored.snapshot.session_id.clone(),
+            base_revision: stored.history_base_revision,
+            events: stored.events.clone(),
+        };
+        log.validate()?;
+        let expected_revision = stored
+            .history_base_revision
+            .checked_add(
+                u64::try_from(stored.events.len()).map_err(|_| NodeError::ClientHistoryOverflow)?,
+            )
+            .ok_or(NodeError::ClientHistoryOverflow)?;
+        if expected_revision != stored.snapshot.revision {
+            return Err(NodeError::ClientHistoryRevisionMismatch {
+                expected: stored.snapshot.revision,
+                actual: expected_revision,
+            });
+        }
+        Ok(Self {
+            state: stored.snapshot.state,
+            history_base_revision: stored.history_base_revision,
+            events: stored
+                .events
+                .into_iter()
+                .map(|event| (event.sequence, event))
+                .collect(),
+        })
+    }
+
+    fn apply_received_event(&mut self, event: &SessionEvent) -> Result<ReceivedEvent, NodeError> {
+        if event.sequence <= self.history_base_revision {
+            return Err(NodeError::EventHistoryUnavailable(event.sequence));
+        }
+        if let Some(known) = self.events.get(&event.sequence) {
+            if known == event {
+                return Ok(ReceivedEvent::AlreadySeen);
+            }
+            if known.event_id == event.event_id {
+                return Err(NodeError::EventIdCollision {
+                    event_id: event.event_id.0.clone(),
+                    known_sequence: known.sequence,
+                    incoming_sequence: event.sequence,
+                });
+            }
+            return Err(NodeError::EventSequenceCollision {
+                sequence: event.sequence,
+                known_event_id: known.event_id.0.clone(),
+                incoming_event_id: event.event_id.0.clone(),
+            });
+        }
+        if let Some(known) = self
+            .events
+            .values()
+            .find(|known| known.event_id == event.event_id)
+        {
+            return Err(NodeError::EventIdCollision {
+                event_id: event.event_id.0.clone(),
+                known_sequence: known.sequence,
+                incoming_sequence: event.sequence,
+            });
+        }
+        let expected = self
+            .state
+            .revision
+            .checked_add(1)
+            .ok_or(NodeError::ClientHistoryOverflow)?;
+        if event.sequence != expected {
+            return Ok(ReceivedEvent::Gap);
+        }
+        self.state.apply(event)?;
+        self.events.insert(event.sequence, event.clone());
+        Ok(ReceivedEvent::Applied)
+    }
+}
+
 fn write_json_atomically(path: &Path, value: &impl Serialize) -> Result<(), NodeError> {
     let temporary = path.with_extension("tmp");
     let bytes = serde_json::to_vec_pretty(value)?;
@@ -654,18 +941,24 @@ fn write_json_atomically(path: &Path, value: &impl Serialize) -> Result<(), Node
     Ok(())
 }
 
-fn load_client_state(config: &ClientConfig) -> Result<SessionState, NodeError> {
+fn load_client_replica(config: &ClientConfig) -> Result<ClientReplica, NodeError> {
     let path = client_state_path(config);
     if !path.exists() {
-        return Ok(SessionState::uninitialized(config.session_id.clone()));
+        return Ok(ClientReplica::uninitialized(config.session_id.clone()));
     }
-    let snapshot: SnapshotV0 = serde_json::from_slice(&fs::read(path)?)?;
-    snapshot.validate()?;
-    ensure_session(&snapshot.session_id, &config.session_id)?;
-    Ok(snapshot.state)
+    let value: Value = serde_json::from_slice(&fs::read(path)?)?;
+    let replica = if value.get("snapshot").is_some() {
+        ClientReplica::from_v1(serde_json::from_value(value)?)?
+    } else {
+        let snapshot: SnapshotV0 = serde_json::from_value(value)?;
+        snapshot.validate()?;
+        ClientReplica::from_snapshot(snapshot)
+    };
+    ensure_session(&replica.state.session_id, &config.session_id)?;
+    Ok(replica)
 }
 
-fn save_client_state(config: &ClientConfig, state: &SessionState) -> Result<(), NodeError> {
+fn save_client_replica(config: &ClientConfig, replica: &ClientReplica) -> Result<(), NodeError> {
     let path = client_state_path(config);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -674,11 +967,17 @@ fn save_client_state(config: &ClientConfig, state: &SessionState) -> Result<(), 
         family: PROTOCOL_FAMILY.to_owned(),
         protocol_version: PROTOCOL_VERSION,
         schema_version: SNAPSHOT_SCHEMA_VERSION,
-        session_id: state.session_id.clone(),
-        revision: state.revision,
-        state: state.clone(),
+        session_id: replica.state.session_id.clone(),
+        revision: replica.state.revision,
+        state: replica.state.clone(),
     };
-    write_json_atomically(&path, &snapshot)
+    let stored = ClientReplicaV1 {
+        schema_version: CLIENT_REPLICA_SCHEMA_VERSION,
+        history_base_revision: replica.history_base_revision,
+        snapshot,
+        events: replica.events.values().cloned().collect(),
+    };
+    write_json_atomically(&path, &stored)
 }
 
 fn client_state_path(config: &ClientConfig) -> PathBuf {
@@ -830,6 +1129,42 @@ pub enum NodeError {
     Protocol(#[from] sytog_protocol::ProtocolError),
     #[error("invalid session directory")]
     InvalidSessionPath,
+    #[error("unsupported accepted-command batch schema version: {0}")]
+    UnsupportedAcceptedBatchSchema(u16),
+    #[error("unknown journal record type: {0}")]
+    UnknownJournalRecord(String),
+    #[error("accepted-command batch must not be empty")]
+    EmptyAcceptedBatch,
+    #[error("accepted command {0} has no events")]
+    AcceptedCommandWithoutEvents(String),
+    #[error("accepted command {0} has no event with matching causation")]
+    AcceptedCommandMissingCausation(String),
+    #[error("duplicate accepted command in journal: {0}")]
+    DuplicateAcceptedCommand(String),
+    #[error("unsupported client replica schema version: {0}")]
+    UnsupportedClientReplicaSchema(u16),
+    #[error("client event history length overflow")]
+    ClientHistoryOverflow,
+    #[error("client history ends at revision {actual}, snapshot is at {expected}")]
+    ClientHistoryRevisionMismatch { expected: u64, actual: u64 },
+    #[error("cannot verify old event at sequence {0}: client history is unavailable")]
+    EventHistoryUnavailable(u64),
+    #[error(
+        "event sequence collision at {sequence}: known={known_event_id}, incoming={incoming_event_id}"
+    )]
+    EventSequenceCollision {
+        sequence: u64,
+        known_event_id: String,
+        incoming_event_id: String,
+    },
+    #[error(
+        "event id collision for {event_id}: known sequence={known_sequence}, incoming sequence={incoming_sequence}"
+    )]
+    EventIdCollision {
+        event_id: String,
+        known_sequence: u64,
+        incoming_sequence: u64,
+    },
     #[error("client sent a host-only network message")]
     UnexpectedClientMessage,
     #[error("host sent a client-only network message")]
@@ -841,9 +1176,98 @@ mod tests {
     use super::*;
     use sytog_demo_vote::VoteActivity;
     use sytog_demo_vote::VoteState;
+    use sytog_domain::{EventId, EventKind, SessionEventKind};
 
     fn temporary_directory(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("sytog-{name}-{}", std::process::id()))
+    }
+
+    fn created_event(display_name: &str) -> SessionEvent {
+        SessionEvent {
+            event_id: EventId::from("create:0"),
+            sequence: 1,
+            causation_id: MessageId::from("create"),
+            actor: ParticipantId::from(HOST_ID),
+            kind: EventKind::Session(SessionEventKind::SessionCreated {
+                creator: ParticipantId::from(HOST_ID),
+                display_name: display_name.to_owned(),
+            }),
+        }
+    }
+
+    #[test]
+    fn identical_received_event_is_a_safe_noop() {
+        let mut replica = ClientReplica::uninitialized(SessionId::from("duplicate-event"));
+        let event = created_event("Host");
+        assert_eq!(
+            replica
+                .apply_received_event(&event)
+                .expect("first event applies"),
+            ReceivedEvent::Applied
+        );
+        let before = replica.state.clone();
+        assert_eq!(
+            replica
+                .apply_received_event(&event)
+                .expect("identical event is accepted"),
+            ReceivedEvent::AlreadySeen
+        );
+        assert_eq!(replica.state, before);
+    }
+
+    #[test]
+    fn reused_event_id_with_different_content_is_rejected() {
+        let mut replica = ClientReplica::uninitialized(SessionId::from("event-id-collision"));
+        replica
+            .apply_received_event(&created_event("Host"))
+            .expect("first event applies");
+        assert!(matches!(
+            replica.apply_received_event(&created_event("Different Host")),
+            Err(NodeError::EventIdCollision { .. })
+        ));
+    }
+
+    #[test]
+    fn old_sequence_with_different_content_is_rejected() {
+        let mut replica = ClientReplica::uninitialized(SessionId::from("sequence-collision"));
+        replica
+            .apply_received_event(&created_event("Host"))
+            .expect("first event applies");
+        let mut conflicting = created_event("Host");
+        conflicting.event_id = EventId::from("other:0");
+        assert!(matches!(
+            replica.apply_received_event(&conflicting),
+            Err(NodeError::EventSequenceCollision { .. })
+        ));
+    }
+
+    #[test]
+    fn received_event_identity_survives_client_restart() {
+        let directory = temporary_directory("client-event-history");
+        if directory.exists() {
+            fs::remove_dir_all(&directory).expect("old test directory can be removed");
+        }
+        let config = ClientConfig {
+            url: "ws://127.0.0.1:0".to_owned(),
+            data_dir: directory.clone(),
+            session_id: SessionId::from("client-event-history"),
+            participant_id: ParticipantId::from("alice"),
+        };
+        let event = created_event("Host");
+        let mut replica = ClientReplica::uninitialized(config.session_id.clone());
+        replica
+            .apply_received_event(&event)
+            .expect("first event applies");
+        save_client_replica(&config, &replica).expect("replica persists");
+
+        let mut reloaded = load_client_replica(&config).expect("replica reloads");
+        assert_eq!(
+            reloaded
+                .apply_received_event(&event)
+                .expect("identical event remains known"),
+            ReceivedEvent::AlreadySeen
+        );
+        fs::remove_dir_all(directory).expect("test directory can be removed");
     }
 
     #[test]
@@ -867,6 +1291,53 @@ mod tests {
             restarted.canonical.blocking_lock().state.revision,
             first_revision
         );
+        fs::remove_dir_all(directory).expect("test directory can be removed");
+    }
+
+    #[tokio::test]
+    async fn host_loads_legacy_events_and_appends_versioned_acceptances() {
+        let directory = temporary_directory("legacy-journal");
+        if directory.exists() {
+            fs::remove_dir_all(&directory).expect("old test directory can be removed");
+        }
+        let config = ServerConfig {
+            bind: "127.0.0.1:0".to_owned(),
+            data_dir: directory.clone(),
+            session_id: SessionId::from("legacy-journal"),
+        };
+        let journal = JournalStore::new(&directory, &config.session_id);
+        fs::create_dir_all(&journal.directory).expect("journal directory is created");
+        let mut state = SessionState::uninitialized(config.session_id.clone());
+        let request = CommandRequest {
+            message_id: MessageId::from("legacy-bootstrap"),
+            actor: ParticipantId::from(HOST_ID),
+            expected_revision: 0,
+            command: Command::Session(SessionCommand::CreateSession {
+                display_name: "Legacy Host".to_owned(),
+            }),
+        };
+        let decision =
+            sytog_runtime::execute(&mut state, &request, None).expect("bootstrap succeeds");
+        let mut legacy_line =
+            serde_json::to_vec(&decision.events[0]).expect("legacy event serializes");
+        legacy_line.push(b'\n');
+        fs::write(journal.events_path(), legacy_line).expect("legacy journal is written");
+
+        let host = Host::load_or_create(&config, Arc::new(VoteActivity))
+            .expect("legacy journal remains readable");
+        assert_eq!(host.current_revision().await, 1);
+        host.join(
+            ParticipantId::from("alice"),
+            "Alice".to_owned(),
+            MessageId::from("versioned-join"),
+        )
+        .await
+        .expect("new acceptance appends after legacy event");
+        drop(host);
+
+        let restarted = Host::load_or_create(&config, Arc::new(VoteActivity))
+            .expect("mixed legacy and versioned journal replays");
+        assert_eq!(restarted.current_revision().await, 2);
         fs::remove_dir_all(directory).expect("test directory can be removed");
     }
 
@@ -945,6 +1416,187 @@ mod tests {
         let restarted = Host::load_or_create(&config, Arc::new(VoteActivity))
             .expect("host replays complete journal");
         assert_eq!(restarted.current_revision().await, 8);
+        fs::remove_dir_all(directory).expect("test directory can be removed");
+    }
+
+    #[tokio::test]
+    async fn accepted_command_is_deduplicated_without_new_events() {
+        let directory = temporary_directory("accepted-command-dedup");
+        if directory.exists() {
+            fs::remove_dir_all(&directory).expect("old test directory can be removed");
+        }
+        let config = ServerConfig {
+            bind: "127.0.0.1:0".to_owned(),
+            data_dir: directory.clone(),
+            session_id: SessionId::from("accepted-command-dedup"),
+        };
+        let host = Host::load_or_create(&config, Arc::new(VoteActivity)).expect("host bootstraps");
+        host.join(
+            ParticipantId::from("alice"),
+            "Alice".to_owned(),
+            MessageId::from("join-alice"),
+        )
+        .await
+        .expect("Alice joins");
+        let request = CommandRequest {
+            message_id: MessageId::from("open-once"),
+            actor: ParticipantId::from("alice"),
+            expected_revision: 2,
+            command: Command::Activity(VoteActivity::open(&["tea", "coffee"])),
+        };
+        let accepted = host
+            .submit(request.clone())
+            .await
+            .expect("first submission is accepted");
+        let revision = host.current_revision().await;
+        let duplicate = host
+            .submit(request)
+            .await
+            .expect("an accepted command returns its prior success");
+        assert!(duplicate.duplicate);
+        assert_eq!(duplicate.events, accepted.events);
+        assert_eq!(host.current_revision().await, revision);
+        fs::remove_dir_all(directory).expect("test directory can be removed");
+    }
+
+    #[tokio::test]
+    async fn accepted_command_id_with_different_content_is_rejected_explicitly() {
+        let directory = temporary_directory("command-id-collision");
+        if directory.exists() {
+            fs::remove_dir_all(&directory).expect("old test directory can be removed");
+        }
+        let config = ServerConfig {
+            bind: "127.0.0.1:0".to_owned(),
+            data_dir: directory.clone(),
+            session_id: SessionId::from("command-id-collision"),
+        };
+        let host = Host::load_or_create(&config, Arc::new(VoteActivity)).expect("host bootstraps");
+        host.join(
+            ParticipantId::from("alice"),
+            "Alice".to_owned(),
+            MessageId::from("join-alice"),
+        )
+        .await
+        .expect("Alice joins");
+        host.submit(CommandRequest {
+            message_id: MessageId::from("reused-command"),
+            actor: ParticipantId::from("alice"),
+            expected_revision: 2,
+            command: Command::Activity(VoteActivity::open(&["tea", "coffee"])),
+        })
+        .await
+        .expect("first submission is accepted");
+
+        let rejection = host
+            .submit(CommandRequest {
+                message_id: MessageId::from("reused-command"),
+                actor: ParticipantId::from("alice"),
+                expected_revision: 4,
+                command: Command::Activity(VoteActivity::submit("tea")),
+            })
+            .await
+            .expect_err("different command content must be rejected");
+        assert_eq!(rejection.code, "command_id_collision");
+        fs::remove_dir_all(directory).expect("test directory can be removed");
+    }
+
+    #[tokio::test]
+    async fn accepted_command_deduplication_survives_restart() {
+        let directory = temporary_directory("command-dedup-restart");
+        if directory.exists() {
+            fs::remove_dir_all(&directory).expect("old test directory can be removed");
+        }
+        let config = ServerConfig {
+            bind: "127.0.0.1:0".to_owned(),
+            data_dir: directory.clone(),
+            session_id: SessionId::from("command-dedup-restart"),
+        };
+        let request = CommandRequest {
+            message_id: MessageId::from("durable-command"),
+            actor: ParticipantId::from("alice"),
+            expected_revision: 2,
+            command: Command::Activity(VoteActivity::open(&["tea", "coffee"])),
+        };
+        let host = Host::load_or_create(&config, Arc::new(VoteActivity)).expect("host bootstraps");
+        host.join(
+            ParticipantId::from("alice"),
+            "Alice".to_owned(),
+            MessageId::from("join-alice"),
+        )
+        .await
+        .expect("Alice joins");
+        let accepted = host
+            .submit(request.clone())
+            .await
+            .expect("first submission is accepted");
+        let revision = host.current_revision().await;
+        drop(host);
+
+        let restarted =
+            Host::load_or_create(&config, Arc::new(VoteActivity)).expect("host restarts");
+        let duplicate = restarted
+            .submit(request)
+            .await
+            .expect("accepted command remains known after restart");
+        assert!(duplicate.duplicate);
+        assert_eq!(duplicate.events, accepted.events);
+        assert_eq!(restarted.current_revision().await, revision);
+        let collision = restarted
+            .submit(CommandRequest {
+                message_id: MessageId::from("durable-command"),
+                actor: ParticipantId::from("alice"),
+                expected_revision: revision,
+                command: Command::Activity(VoteActivity::submit("tea")),
+            })
+            .await
+            .expect_err("persisted command identity rejects different content");
+        assert_eq!(collision.code, "command_id_collision");
+        fs::remove_dir_all(directory).expect("test directory can be removed");
+    }
+
+    #[tokio::test]
+    async fn rejected_command_id_can_be_reevaluated() {
+        let directory = temporary_directory("rejected-command-retry");
+        if directory.exists() {
+            fs::remove_dir_all(&directory).expect("old test directory can be removed");
+        }
+        let config = ServerConfig {
+            bind: "127.0.0.1:0".to_owned(),
+            data_dir: directory.clone(),
+            session_id: SessionId::from("rejected-command-retry"),
+        };
+        let host = Host::load_or_create(&config, Arc::new(VoteActivity)).expect("host bootstraps");
+        host.join(
+            ParticipantId::from("alice"),
+            "Alice".to_owned(),
+            MessageId::from("join-alice"),
+        )
+        .await
+        .expect("Alice joins");
+        let message_id = MessageId::from("retry-after-rejection");
+        host.submit(CommandRequest {
+            message_id: message_id.clone(),
+            actor: ParticipantId::from("alice"),
+            expected_revision: 2,
+            command: Command::Activity(VoteActivity::close()),
+        })
+        .await
+        .expect_err("invalid first submission is rejected");
+        assert_eq!(host.current_revision().await, 2);
+        drop(host);
+
+        let restarted =
+            Host::load_or_create(&config, Arc::new(VoteActivity)).expect("host restarts");
+        restarted
+            .submit(CommandRequest {
+                message_id,
+                actor: ParticipantId::from("alice"),
+                expected_revision: 2,
+                command: Command::Activity(VoteActivity::open(&["tea", "coffee"])),
+            })
+            .await
+            .expect("a rejected identifier is not retained");
+        assert_eq!(restarted.current_revision().await, 4);
         fs::remove_dir_all(directory).expect("test directory can be removed");
     }
 }
