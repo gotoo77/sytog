@@ -33,7 +33,7 @@ for a network event that a client discards before validation.
 | INV-006 | Safe handling of duplicate events | Guaranteed |
 | INV-007 | Durable deduplication of accepted commands | Guaranteed |
 | INV-008 | Linearization by the authoritative host | Guaranteed |
-| INV-009 | Recovery from a partial final JSONL line | Refuted / limited |
+| INV-009 | Recovery from a partial final JSONL line | Guaranteed |
 | INV-010 | Rejection of intermediate JSONL corruption | Guaranteed |
 | INV-011 | Reconnection and sequence-based catch-up | Demonstrated |
 | INV-012 | Bounded memory and backpressure | Refuted / limited |
@@ -61,7 +61,7 @@ nothing about a JSONL file that has not yet been loaded and validated.
 - [`SessionState::apply`](../crates/sytog-domain/src/lib.rs#L107-L131) rejects
   every other sequence;
 - the node validates the prospective journal before persistence in
-  [`Host::commit`](../crates/sytog-node/src/lib.rs#L630-L697).
+  [`Host::commit`](../crates/sytog-node/src/lib.rs#L643-L710).
 
 **Behavior on violation.** The validator returns `UnexpectedEventSequence`, or
 the reducer returns `UnexpectedSequence`. `replay_log` stops without producing
@@ -92,7 +92,7 @@ every append. It does not cover the client path described in INV-006.
 - the `event_ids` set in
   [`EventLogV0::validate`](../crates/sytog-protocol/src/lib.rs#L51-L70);
 - prospective validation in
-  [`Host::commit`](../crates/sytog-node/src/lib.rs#L630-L681) before writing.
+  [`Host::commit`](../crates/sytog-node/src/lib.rs#L643-L694) before writing.
 
 **Behavior on violation.** The journal is rejected with
 `ProtocolError::DuplicateEventId`. The host turns a prospective collision into
@@ -177,60 +177,77 @@ to verify rejection rather than divergence.
 
 ### INV-009 — Recovery from a partial final JSONL line
 
-**Status: Refuted / limited**
+**Status: Guaranteed**
 
-**Exact target statement.** After a crash that left only the last JSONL line
-incomplete, the host should identify that uncommitted suffix with certainty,
-remove it, and reconstruct the last valid durable prefix.
+**Exact statement.** A fully valid prefix followed by a final suffix not
+terminated by `\n` is recovered by physically truncating the file to the byte
+after the last `\n`. No event or receipt from the suffix is applied.
 
-**Current state, assumptions, and scope.** This recovery does not exist.
-`JournalStore::load` deserializes every non-empty line and propagates the first
-JSON error. A truncated final line—whether a raw V0 event or a V1 accepted
-command batch—therefore currently blocks restart, just like any other
-corruption.
+**Assumptions and scope.** The `\n` character is a line's logical commit
+boundary. Every non-empty, unterminated final suffix is considered uncommitted,
+even if it accidentally forms complete JSON. The prefix must be syntactically
+valid, satisfy journal invariants, and replay completely before any truncation.
+The rule applies to raw V0 events and V1 receipts.
 
 **Enforcement point.**
 
-- strict reading in
-  [`JournalStore::load`](../crates/sytog-node/src/lib.rs#L726-L784);
-- append writes a batch and calls `sync_data` in
-  [`JournalStore::append_accepted`](../crates/sytog-node/src/lib.rs#L786-L801), without
-  framing or a commit marker.
+- [`JournalStore::load`](../crates/sytog-node/src/lib.rs#L739-L838) computes
+  `safe_offset` and `original_length`, then loads terminated lines only;
+- [`Host::load_or_create`](../crates/sytog-node/src/lib.rs#L479-L538) validates and
+  replays the prefix before allowing repair;
+- [`JournalStore::apply_recovery`](../crates/sytog-node/src/lib.rs#L840-L859) verifies
+  that length has not changed, calls `set_len(safe_offset)`, synchronizes the
+  file, and emits a diagnostic containing both offsets.
 
-**Behavior on violation.** Loading returns `NodeError::Json` or an I/O error.
-The host does not start and truncates nothing automatically.
+**Behavior on recovery or violation.** Successful recovery writes to stderr:
+`journal recovery: ... from byte <original_length> to safe offset <safe_offset>`.
+A second restart finds no suffix and rewrites nothing. If the file changes
+between inspection and truncation, or an I/O operation fails, the host fails
+without hiding the error.
 
-**Existing tests.** No test covers a partial final write.
+**Existing tests.**
 
-**Reproducible breaking attempt.** Copy a session directory, truncate the last
-bytes of `events.jsonl` in the middle of its final JSON object, then start the
-host from the copy. In the current state, startup must fail: this counterexample
-confirms the limitation.
+- `truncated_legacy_final_line_recovers_valid_prefix`;
+- `invalid_final_bytes_recover_valid_prefix`;
+- `truncated_v1_receipt_recovers_once`;
+- `truncated_v1_event_preserves_prior_command_deduplication`;
+- `final_empty_line_is_valid_and_unchanged`.
+
+**Reproducible breaking attempt.** Copy a journal, record its size, append a
+fragment without `\n`, then restart. Verify the diagnostic, physical offset,
+rebuilt revision, and absence of another modification on the next restart.
 
 ### INV-010 — Rejection of intermediate JSONL corruption
 
 **Status: Guaranteed**
 
-**Exact statement.** If any non-empty line in the JSONL journal cannot be read
-or deserialized as a raw V0 event or a recognized V1 batch, loading fails. No
-suffix following that line is silently replayed.
+**Exact statement.** Every non-empty terminated line that cannot be read or
+deserialized as a raw V0 event or a recognized V1 batch causes a fail-closed
+error. Every syntactically valid JSON entry inconsistent with the schema,
+sequences, identifiers, or reducer also causes a fail-closed error.
 
 **Assumptions and scope.** The guarantee covers errors visible to the line
-reader and `serde_json`. A modification that remains structurally valid JSON is
-then subject to protocol and reducer invariants.
+reader, `serde_json`, receipt schema, `EventLogV0::validate`, and replay. A
+terminated invalid line, including the final one, is never treated as a partial
+write. If an incomplete suffix follows prefix corruption, validation fails
+before any truncation.
 
 **Enforcement point.**
 
 - strict loading and index reconstruction in
-  [`JournalStore::load`](../crates/sytog-node/src/lib.rs#L726-L784);
+  [`JournalStore::load`](../crates/sytog-node/src/lib.rs#L739-L838);
 - complete validation and replay in
-  [`Host::load_or_create`](../crates/sytog-node/src/lib.rs#L472-L525).
+  [`Host::load_or_create`](../crates/sytog-node/src/lib.rs#L479-L538) before
+  `apply_recovery`.
 
 **Behavior on violation.** The host refuses to start. It does not produce a
 state from the valid prefix alone and does not rewrite the journal.
 
-**Existing tests.** No dedicated intermediate-corruption test exists; the load
-path enforces the guarantee but still needs a regression test.
+**Existing tests.**
+
+- `syntactic_corruption_in_the_middle_fails_without_repair`;
+- `semantic_corruption_fails_without_repair`;
+- `terminated_invalid_final_line_fails_without_repair`.
 
 **Reproducible breaking attempt.** On a copy of a journal containing at least
 three lines, replace the second line with `not-json` and restart the host.
@@ -258,11 +275,11 @@ expected revision, and payload.
 
 - `SubmitCommand` carries the
   [`CommandRequest`](../crates/sytog-transport/src/lib.rs#L14-L41);
-- [`Host::submit`](../crates/sytog-node/src/lib.rs#L546-L606) consults the durable index
+- [`Host::submit`](../crates/sytog-node/src/lib.rs#L559-L619) consults the durable index
   before checking revision;
 - `AcceptedBatchV1` persists the accepted request and its exact returned event
   list in the same versioned line;
-- [`JournalStore::load`](../crates/sytog-node/src/lib.rs#L726-L784) reconstructs the
+- [`JournalStore::load`](../crates/sytog-node/src/lib.rs#L739-L838) reconstructs the
   command index after restart.
 
 **Behavior on repetition or collision.**
@@ -305,11 +322,11 @@ the journal is canonical and reproducible through replay.
 
 **Enforcement point.**
 
-- lock in [`Host::join`](../crates/sytog-node/src/lib.rs#L527-L544);
+- lock in [`Host::join`](../crates/sytog-node/src/lib.rs#L540-L557);
 - lock and revision check in
-  [`Host::submit`](../crates/sytog-node/src/lib.rs#L546-L573);
+  [`Host::submit`](../crates/sytog-node/src/lib.rs#L559-L586);
 - validation, persistence, and commit remain under that guard through
-  [`Host::commit`](../crates/sytog-node/src/lib.rs#L630-L697).
+  [`Host::commit`](../crates/sytog-node/src/lib.rs#L643-L710).
 
 **Behavior under concurrency.** One command wins the lock and may be accepted.
 Another carrying the same `expected_revision` is then rejected with
@@ -342,13 +359,13 @@ may leave a partial suffix while preventing the memory commit.
 
 **Enforcement point.**
 
-- ordering in [`Host::commit`](../crates/sytog-node/src/lib.rs#L630-L697);
+- ordering in [`Host::commit`](../crates/sytog-node/src/lib.rs#L643-L710);
 - writing and synchronization in
-  [`JournalStore::append_accepted`](../crates/sytog-node/src/lib.rs#L786-L801).
+  [`JournalStore::append_accepted`](../crates/sytog-node/src/lib.rs#L861-L876).
 
 **Behavior on violation.** An append error becomes `persistence_failed` and
-prevents memory commit and broadcast. If the write was partial, the next
-restart currently encounters INV-009.
+prevents memory commit and broadcast. If the write left an unterminated final
+suffix, the next restart applies INV-009 after validating the prefix.
 
 **Existing tests.** Deduplication-after-restart and mixed V0/V1 journal tests
 cover the successful path. No test yet injects a crash or error at every append
@@ -380,7 +397,7 @@ algorithm are not specified as a canonical serialization.
 - local reduction in
   [`connect_client`](../crates/sytog-node/src/lib.rs#L253-L293);
 - canonical stream produced after commit in
-  [`Host::commit`](../crates/sytog-node/src/lib.rs#L630-L697).
+  [`Host::commit`](../crates/sytog-node/src/lib.rs#L643-L710).
 
 **Behavior on violation.** Detected gaps trigger catch-up. No automatic state
 or hash comparison with the host currently detects silent divergence.
@@ -416,10 +433,10 @@ canonical journal remains additionally protected by INV-001 and INV-002.
 
 - `ClientReplicaV1` persists the snapshot, history base revision, and known
   events;
-- [`ClientReplica::apply_received_event`](../crates/sytog-node/src/lib.rs#L890-L933)
+- [`ClientReplica::apply_received_event`](../crates/sytog-node/src/lib.rs#L965-L1008)
   compares the complete event by sequence and searches for every reused
   `event_id` before reduction;
-- [`load_client_replica`](../crates/sytog-node/src/lib.rs#L944-L958) validates the
+- [`load_client_replica`](../crates/sytog-node/src/lib.rs#L1019-L1034) validates the
   versioned history after restart.
 
 **Behavior on duplication or collision.**
@@ -499,11 +516,11 @@ no pagination, maximum window, compaction, quota, or overload rejection.
 **Current enforcement point.**
 
 - channel capacity in
-  [`Host::load_or_create`](../crates/sytog-node/src/lib.rs#L513-L524);
+  [`Host::load_or_create`](../crates/sytog-node/src/lib.rs#L526-L537);
 - recovery after `Lagged` in
   [`handle_connection`](../crates/sytog-node/src/lib.rs#L440-L451);
 - unbounded suffix clone in
-  [`Host::events_after`](../crates/sytog-node/src/lib.rs#L699-L708).
+  [`Host::events_after`](../crates/sytog-node/src/lib.rs#L712-L721).
 
 **Current behavior under pressure.** The in-memory journal grows with the
 session. An old catch-up allocates in proportion to the suffix. A slow client
@@ -520,14 +537,16 @@ batches.
 
 ## Proposed breaking-experiment order
 
-1. **Duplicates and collisions** — define history identity before any other
-   measurement.
-2. **JSONL corruption** — establish what is durably committed and recoverable.
-3. **Concurrency** — exercise canonical ordering once history is reliable.
+1. **Duplicates and collisions — complete**: accepted-command identity and
+   durable idempotence are now defined.
+2. **JSONL corruption — complete**: the commit boundary and incomplete-suffix
+   recovery are now defined.
+3. **Concurrency — next**: exercise canonical ordering once history is
+   reliable.
 4. **Old reconnection** — verify convergence over a large suffix.
 5. **Pressure and backpressure** — measure bounds after the previous semantics
    are stable.
 
-The first two families protect canonical-journal integrity. Load tests or many
-parallel clients would mostly produce noise until history identity,
-idempotence, and recoverability are defined.
+The first two families now protect canonical-journal integrity. Concurrency is
+the next experiment; old reconnection and pressure remain deferred until its
+ordering semantics are stable.
