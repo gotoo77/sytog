@@ -1,18 +1,28 @@
-# ADR 0007: V0.1 activity and capability boundaries
+Langue canonique : Français
 
-Status: accepted
+English version: [English](0007-v01-consolidation-boundaries.en.md)
 
-The first vertical slice proved two accidental specializations. V0.1 therefore:
+[Français](0007-v01-consolidation-boundaries.md) | [English](0007-v01-consolidation-boundaries.en.md)
 
-- keeps closed enums for generic session rules;
-- routes activity commands/events through a versioned opaque envelope;
-- implements `demo.counter` outside the core through a minimal `ActivityEngine`;
-- identifies and evaluates concrete capability offers rather than only nodes;
-- uses typed LLM and CPU contract families;
-- scopes observations and availability to offer ids;
-- publishes a V1 score breakdown;
-- versions logs and snapshots independently from domain state.
+# ADR 0007 : Frontières des activités et capacités en V0.1
 
-This is not a dynamic plugin system. New contract enum variants remain deliberate
-compile-time changes until several real families justify a schema registry.
+Statut : accepté
 
+La première tranche verticale a révélé deux spécialisations accidentelles. La
+V0.1 :
+
+- conserve des enums fermées pour les règles génériques de session ;
+- route les commandes et événements d’activité par une enveloppe opaque
+  versionnée ;
+- implémente `demo.counter` hors du cœur au moyen d’un `ActivityEngine`
+  minimal ;
+- identifie et évalue des offres concrètes de capacité plutôt que les seuls
+  nœuds ;
+- utilise des familles de contrats typées pour le LLM et le CPU ;
+- rattache observations et disponibilité aux identifiants d’offre ;
+- publie une décomposition V1 du score ;
+- versionne journaux et snapshots indépendamment de l’état du domaine.
+
+Il ne s’agit pas d’un système dynamique de plugins. Les nouveaux variants
+d’enum de contrat restent des modifications volontaires à la compilation tant
+que plusieurs familles réelles ne justifient pas un registre de schémas.

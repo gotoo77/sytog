@@ -1,465 +1,405 @@
-# ADR 0008: Overload and backpressure contract
+Langue canonique : Français
 
-Status: accepted
+English version: [English](0008-overload-and-backpressure-contract.en.md)
 
-Implementation note: protocol slice 1 defines V2 vocabulary, validation,
-versioned decoding, stable overload reasons, and the observable close contract.
-The V0.2 node still emits and handles V1 only; no queue, timeout, admission,
-catch-up, snapshot, or retention behavior from this ADR is active yet.
+[Français](0008-overload-and-backpressure-contract.md) | [English](0008-overload-and-backpressure-contract.en.md)
 
-## Context
+# ADR 0008 : Contrat de surcharge et de backpressure
 
-SYTOG V0.2 has one authoritative host. A command is decided, validated,
-appended and synchronized to the canonical journal, committed in memory, then
-published while the canonical lock is held. Exact replay and the journal order
-are authoritative; notification delivery is not.
+Statut : accepté
 
-The current node has no explicit overload contract:
+Note d’implémentation : la tranche protocolaire 1 définit le vocabulaire V2, sa
+validation, le décodage versionné, les raisons stables de surcharge et le
+contrat de fermeture observable. Le nœud V0.2 continue d’émettre et de traiter
+uniquement V1 ; aucun comportement de file, timeout, admission, catch-up,
+snapshot ou rétention décrit ici n’est encore actif.
 
-- `serve` spawns one task for every accepted TCP connection without a quota;
-- `Host` keeps the complete event journal and accepted-command index in memory;
-- accepted batches are published through a 256-slot Tokio broadcast channel;
-- publication does not wait for subscribers;
-- a lagging subscriber loses old broadcast slots, observes `Lagged`, then
-  clones the complete missing suffix from the in-memory journal;
-- `Hello` and `CatchUpRequest` return the entire suffix in one `EventBatch`;
-- WebSocket serialization and writes have no size or duration limit;
-- the client retains every event received after its history base revision.
+## Contexte
 
-The V0.2 breaking experiments demonstrated that 300 commits complete while one
-subscriber remains idle. That subscriber then observes `Lagged` and recovers by
-cloning all 300 missing events. This preserves canonical truth but does not
-bound memory, connection work, catch-up work, or network writes.
+SYTOG V0.2 possède un hôte autoritatif unique. Une commande est décidée,
+validée, ajoutée et synchronisée dans le journal canonique, commitée en mémoire,
+puis publiée pendant que le verrou canonique est détenu. Le replay exact et
+l’ordre du journal font autorité ; la livraison des notifications ne le fait
+pas.
 
-SYTOG prioritizes stability, explicit behavior, exact replay, and deterministic
-recovery over maximum throughput. A slow or hostile client must not silently
-lose facts, and must not be able to block authoritative progress indefinitely.
+Le nœud actuel ne possède aucun contrat explicite de surcharge :
 
-## Decision drivers
+- `serve` crée une tâche pour chaque connexion TCP acceptée sans quota ;
+- `Host` conserve en mémoire tout le journal et l’index des commandes acceptées ;
+- les lots acceptés utilisent un canal broadcast Tokio de 256 emplacements ;
+- la publication n’attend pas les abonnés ;
+- un abonné en retard perd les anciens emplacements, reçoit `Lagged`, puis
+  clone tout le suffixe manquant depuis le journal mémoire ;
+- `Hello` et `CatchUpRequest` renvoient tout le suffixe dans un `EventBatch` ;
+- la sérialisation et les écritures WebSocket n’ont aucune limite de taille ou
+  de durée ;
+- le client conserve tous les événements reçus après sa révision de base.
 
-- Preserve the canonical journal, exact replay, and single-host total order.
-- Never report an event as delivered merely because it was published or queued.
-- Prevent one slow connection from consuming unbounded memory or blocking
-  unrelated clients.
-- Bound server-wide admission as well as per-connection work.
-- Make overload, lag, disconnect, and required resynchronization observable.
-- Keep reconnect and catch-up deterministic from a client-owned durable cursor.
-- Prefer explicit rejection or disconnection to silent loss or indefinite wait.
-- Separate durable authority from notification and catch-up retention.
-- Introduce the contract in small, testable slices.
+Les expériences de rupture V0.2 ont montré que 300 commits s’achèvent pendant
+qu’un abonné reste inactif. Celui-ci observe ensuite `Lagged` et récupère en
+clonant les 300 événements. La vérité canonique est préservée, mais la mémoire,
+les connexions, le catch-up et les écritures réseau restent non bornés.
 
-## Recommendation
+SYTOG privilégie la stabilité, le comportement explicite, le replay exact et la
+récupération déterministe plutôt que le débit maximal. Un client lent ou
+hostile ne doit ni perdre silencieusement des faits, ni bloquer indéfiniment la
+progression autoritative.
 
-Adopt the combined strategy: bounded per-connection queues, explicit lag
-detection, write deadlines, slow-consumer disconnect, and deterministic
-reconnect/catch-up from a client-owned durable cursor. Add separate global
-admission limits so the host may reject excess work before commit without
-coupling authoritative progress to consumer speed.
+## Facteurs de décision
 
-Keep the complete durable archive during the first implementation slices.
-Paginate and bound catch-up before introducing a hot retention floor. Add
-snapshot-plus-suffix resync next, then separate the hot window from the exact
-archive. Do not use destructive journal compaction as the first backpressure
-mechanism.
+- Préserver le journal canonique, le replay exact et l’ordre total mono-hôte.
+- Ne jamais présenter un événement comme livré parce qu’il a été publié ou mis
+  en file.
+- Empêcher une connexion lente de consommer une mémoire illimitée ou de bloquer
+  les autres clients.
+- Borner l’admission globale ainsi que le travail par connexion.
+- Rendre surcharge, retard, déconnexion et resynchronisation observables.
+- Garder un catch-up déterministe depuis un curseur durable appartenant au
+  client.
+- Préférer rejet ou déconnexion explicites à la perte silencieuse ou l’attente
+  indéfinie.
+- Séparer autorité durable, notifications et rétention de catch-up.
+- Introduire le contrat par petites tranches testables.
 
-## Four distinct pressure domains
+## Recommandation
 
-The implementation must not collapse these concerns into one queue:
+Adopter une stratégie combinée : files bornées par connexion, détection
+explicite du retard, délais d’écriture, déconnexion des consommateurs lents et
+reconnexion/catch-up déterministes depuis un curseur durable du client. Ajouter
+des limites globales d’admission afin que l’hôte puisse refuser du travail avant
+commit sans coupler la progression autoritative à la vitesse des consommateurs.
 
-1. **Authoritative production pressure** covers command admission, sequencing,
-   durable append, and commit. It protects the host as a whole.
-2. **Per-connection pressure** covers live notifications waiting for one
-   client. It isolates clients from one another.
-3. **Journal retention** determines which historical facts remain available
-   for replay, audit, and catch-up.
-4. **Catch-up and network pressure** covers page construction, serialization,
-   write duration, and work performed for reconnecting or hostile clients.
+Conserver l’archive durable complète pendant les premières tranches. Paginer et
+borner le catch-up avant d’introduire une fenêtre chaude. Ajouter ensuite le
+resync snapshot-plus-suffixe, puis séparer la fenêtre chaude de l’archive
+exacte. Ne pas utiliser le compactage destructif comme premier mécanisme de
+backpressure.
 
-## Strategies considered
+## Quatre domaines de pression distincts
 
-### A. Globally slow authoritative producers
+1. **Pression de production autoritative** : admission, séquencement, append
+   durable et commit ; elle protège l’hôte entier.
+2. **Pression par connexion** : notifications live en attente pour un client ;
+   elle isole les clients.
+3. **Rétention du journal** : faits historiques disponibles pour replay, audit
+   et catch-up.
+4. **Pression de catch-up et réseau** : construction des pages, sérialisation,
+   durée d’écriture et travail demandé par les clients reconnectés ou hostiles.
 
-- **Safety:** preserves order and can avoid notification loss while every
-  consumer participates.
-- **Availability:** one stalled consumer can stop all accepted work.
-- **Isolation:** none; the slowest client controls the session.
-- **Memory:** can be bounded if producers wait before creating more output.
-- **Global blocking risk:** critical, including deadlock-like operational
-  failure when a client never reads.
-- **Client observation:** commands remain pending for an unbounded duration
-  unless separate producer timeouts are added.
-- **Replay, catch-up, restart:** compatible, but unnecessary because delivery
-  is coupled to commit progress.
-- **Complexity:** mechanically simple, operationally dangerous.
-- **Invariant effect:** may bound queues, but violates availability and the
-  requirement that a client cannot block authoritative progress indefinitely.
+## Stratégies étudiées
 
-Rejected as the primary contract. Global admission may still be bounded and
-may reject new commands explicitly; it must not wait for live consumers.
+### A. Ralentir globalement les producteurs autoritatifs
 
-### B. Give every connection a bounded output queue
+- **Sûreté :** préserve l’ordre et peut éviter la perte de notifications.
+- **Disponibilité :** un consommateur bloqué peut arrêter tout travail accepté.
+- **Isolation :** aucune ; le client le plus lent contrôle la session.
+- **Mémoire :** bornable si les producteurs attendent.
+- **Risque de blocage global :** critique.
+- **Observation client :** commandes en attente sans borne sans timeout séparé.
+- **Replay, catch-up, redémarrage :** compatibles, mais inutilement couplés.
+- **Complexité :** mécanique simple, exploitation dangereuse.
+- **Invariants :** peut borner les files mais viole l’exigence de progression
+  autoritative indépendante des clients.
 
-- **Safety:** safe if queue overflow never mutates canonical truth and never
-  pretends dropped notifications were delivered.
-- **Availability:** authoritative work and other clients continue.
-- **Isolation:** strong, up to global connection and memory quotas.
-- **Memory:** bounded per connection only when both item count and serialized
-  byte budget are enforced.
-- **Global blocking risk:** low; aggregate memory remains unbounded without a
-  connection quota.
-- **Client observation:** overflow needs an explicit slow-consumer transition.
-- **Replay, catch-up, restart:** compatible when the client reconnects from its
-  durable applied cursor.
-- **Complexity:** medium; requires a writer task, queue accounting, cancellation,
-  and shutdown coordination.
-- **Invariant effect:** enables bounded per-connection work, but does not bound
-  the journal or catch-up by itself.
+Rejetée comme contrat principal. L’admission globale peut être bornée et
+refuser explicitement, mais ne doit jamais attendre les consommateurs live.
 
-Accepted as one component, not as the complete contract.
+### B. Donner une file de sortie bornée à chaque connexion
 
-### C. Disconnect consumers that are too slow
+- **Sûreté :** sûre si le dépassement ne change pas la vérité canonique et
+  n’affirme jamais que des notifications abandonnées ont été livrées.
+- **Disponibilité :** l’autorité et les autres clients continuent.
+- **Isolation :** forte, sous réserve de quotas globaux.
+- **Mémoire :** bornée par connexion seulement avec limites en nombre et octets.
+- **Risque global :** faible ; la mémoire agrégée exige un quota de connexions.
+- **Observation client :** le dépassement exige une transition explicite.
+- **Replay, catch-up, redémarrage :** compatibles après reconnexion au curseur
+  durable appliqué.
+- **Complexité :** moyenne : writer, comptage, annulation et fermeture.
+- **Invariants :** borne le travail live, pas le journal ou le catch-up.
 
-- **Safety:** canonical events remain durable; a close notification itself can
-  be lost, so reconnect behavior must also cover unexplained transport loss.
-- **Availability:** high for the host and healthy clients.
-- **Isolation:** strong with connection quotas and write deadlines.
-- **Memory:** bounded if disconnection follows a bounded queue or write timeout.
-- **Global blocking risk:** low.
-- **Client observation:** best-effort protocol reason plus WebSocket close;
-  any close means delivery is unknown beyond the client's durable cursor.
-- **Replay, catch-up, restart:** compatible when reconnect is mandatory.
-- **Complexity:** low to medium, but correct cursor semantics are essential.
-- **Invariant effect:** guarantees bounded connection lifetime under stalled
-  writes; cannot guarantee that the close reason reaches a broken peer.
+Retenue comme composant, pas comme contrat complet.
 
-Accepted when combined with bounded queues and deterministic reconnect.
+### C. Déconnecter les consommateurs trop lents
 
-### D. Drop intermediate notifications and require explicit resynchronization
+- **Sûreté :** les événements restent durables ; le motif de fermeture peut se
+  perdre, donc toute perte de transport doit imposer la même reconnexion.
+- **Disponibilité :** élevée pour l’hôte et les clients sains.
+- **Isolation :** forte avec quotas et délais d’écriture.
+- **Mémoire :** bornée si la déconnexion suit une file ou un timeout borné.
+- **Risque global :** faible.
+- **Observation client :** raison best effort puis fermeture ; toute fermeture
+  rend la livraison inconnue au-delà du curseur durable du client.
+- **Replay, catch-up, redémarrage :** compatibles si la reconnexion est exigée.
+- **Complexité :** faible à moyenne ; la sémantique du curseur est essentielle.
+- **Invariants :** borne la durée d’une écriture bloquée, sans garantir la
+  réception du motif de fermeture.
 
-- **Safety:** safe because notifications are hints and the journal is
-  authoritative.
-- **Availability:** high.
-- **Isolation:** good.
-- **Memory:** bounded for live notification queues.
-- **Global blocking risk:** low.
-- **Client observation:** unsafe if the drop is invisible; safe only with an
-  explicit lag/resync state or connection close.
-- **Replay, catch-up, restart:** naturally compatible.
-- **Complexity:** medium because the protocol must distinguish live delivery
-  from required catch-up.
-- **Invariant effect:** canonical history remains exact; live continuity becomes
-  limited and must never be presented as guaranteed delivery.
+Retenue avec files bornées et reconnexion déterministe.
 
-Accepted only with an explicit transition. Silent notification loss is
-rejected.
+### D. Abandonner des notifications intermédiaires et exiger un resync
 
-### E. Bounded queue, lag detection, disconnect, and reconnect/catch-up
+- **Sûreté :** sûre car le journal, non les notifications, fait autorité.
+- **Disponibilité :** élevée.
+- **Isolation :** bonne.
+- **Mémoire :** bornée pour les files live.
+- **Risque global :** faible.
+- **Observation client :** dangereuse si invisible ; sûre seulement avec état
+  explicite de retard/resync ou fermeture.
+- **Replay, catch-up, redémarrage :** naturellement compatibles.
+- **Complexité :** moyenne.
+- **Invariants :** historique exact, continuité live limitée et jamais présentée
+  comme une livraison garantie.
 
-- **Safety:** preserves canonical truth and makes the recovery boundary explicit.
-- **Availability:** high for the host; overloaded clients reconnect.
-- **Isolation:** strong when all per-connection and global limits are enforced.
-- **Memory:** bounded for live output and concurrent catch-up; journal memory is
-  a separate concern.
-- **Global blocking risk:** low except at the authoritative admission boundary.
-- **Client observation:** explicit slow-consumer or resync-required reason when
-  deliverable; otherwise ordinary close with the same reconnect rule.
-- **Replay, catch-up, restart:** fully aligned with durable client cursors.
-- **Complexity:** medium to high, but decomposable.
-- **Invariant effect:** can guarantee bounded live work and no silent recovery;
-  catch-up availability remains limited by retention.
+Retenue seulement avec une transition explicite. La perte silencieuse est
+rejetée.
 
-Accepted as the V0.2 overload contract.
+### E. File bornée, retard, déconnexion et reconnexion/catch-up
 
-### F. Bound or compact the journal with snapshots and retention
+- **Sûreté :** préserve la vérité canonique et explicite la frontière de reprise.
+- **Disponibilité :** élevée ; les clients surchargés se reconnectent.
+- **Isolation :** forte lorsque toutes les limites sont appliquées.
+- **Mémoire :** bornée pour le live et le catch-up concurrent ; le journal est
+  séparé.
+- **Risque global :** faible hors frontière d’admission autoritative.
+- **Observation client :** raison explicite si livrable, sinon fermeture avec
+  la même règle de reconnexion.
+- **Replay, catch-up, redémarrage :** alignés sur les curseurs durables.
+- **Complexité :** moyenne à forte, mais décomposable.
+- **Invariants :** travail live borné et reprise visible ; disponibilité du
+  catch-up limitée par la rétention.
 
-- **Safety:** unsafe if compaction deletes the only authoritative facts needed
-  for audit or replay. Safe when a validated snapshot is a new replay base and
-  an immutable archive is retained according to policy.
-- **Availability:** improves restart and catch-up cost; clients behind the
-  retention floor require a full resync.
-- **Isolation:** reduces the cost an old client can impose.
-- **Memory:** bounds the hot suffix; total durable archive size needs a separate
-  policy.
-- **Global blocking risk:** compaction itself must be incremental and must not
-  stop commits indefinitely.
-- **Client observation:** the server must expose the earliest available
-  sequence and require snapshot resync when a cursor is older.
-- **Replay, catch-up, restart:** compatible only after snapshot-plus-suffix
-  replay is validated as authoritative.
-- **Complexity:** high; it changes persistence, recovery, and audit semantics.
-- **Invariant effect:** can bound hot retention, but arbitrary historical
-  catch-up becomes impossible without an archive.
+Retenue comme contrat V0.2.
 
-Deferred until snapshot-plus-suffix replay is implemented and verified. The
-first overload slices must not destructively compact the canonical archive.
+### F. Borner ou compacter le journal avec snapshots et rétention
 
-## Decision matrix
+- **Sûreté :** dangereuse si le compactage supprime les seuls faits
+  autoritatifs ; sûre après validation d’un snapshot comme base de replay et
+  conservation d’une archive immuable.
+- **Disponibilité :** améliore redémarrage et catch-up ; les clients sous le
+  plancher de rétention exigent un resync complet.
+- **Isolation :** réduit le coût imposable par un ancien client.
+- **Mémoire :** borne le suffixe chaud ; l’archive durable exige sa politique.
+- **Risque global :** le compactage doit rester incrémental.
+- **Observation client :** expose la première séquence disponible et exige un
+  snapshot lorsque le curseur est plus ancien.
+- **Replay, catch-up, redémarrage :** compatibles seulement après validation du
+  replay snapshot-plus-suffixe.
+- **Complexité :** forte ; persistance, reprise et audit changent.
+- **Invariants :** rétention chaude bornée, mais historique arbitraire
+  impossible sans archive.
 
-| Strategy | Safety | Availability / isolation | Memory | Observable recovery | Replay compatibility | Complexity | Decision |
+Différée jusqu’à validation du replay snapshot-plus-suffixe. Les premières
+tranches ne compactent pas destructivement l’archive canonique.
+
+## Matrice de décision
+
+| Stratégie | Sûreté | Disponibilité / isolation | Mémoire | Reprise observable | Replay | Complexité | Décision |
 |---|---|---|---|---|---|---|---|
-| Global producer slowdown | Strong ordering, coupled delivery | Poor / none | Potentially bounded | Pending commands | Compatible | Low | Reject |
-| Per-connection bounded queue | Strong if overflow is explicit | High / strong | Per-client bounded | Needs lag transition | Compatible | Medium | Adopt |
-| Disconnect slow consumers | Canonical truth preserved | High / strong | Bounded with deadlines | Close then reconnect | Compatible | Medium | Adopt |
-| Drop live notifications | Safe only when visible | High / good | Bounded | Explicit resync required | Compatible | Medium | Adopt conditionally |
-| Queue + lag + reconnect | Strong and explicit | High / strong | Bounded except journal | Deterministic cursor catch-up | Compatible | Medium-high | Recommend |
-| Snapshot + retention | Strong after validated replay base | High / good | Hot data bounded | Snapshot then suffix | Conditional | High | Defer, then adopt |
+| Ralentissement global | Ordre fort, livraison couplée | Faible / aucune | Potentiellement bornée | Commandes en attente | Compatible | Faible | Rejeter |
+| File bornée par connexion | Forte si dépassement explicite | Élevée / forte | Bornée par client | Transition requise | Compatible | Moyenne | Retenir |
+| Déconnexion lente | Vérité canonique préservée | Élevée / forte | Bornée avec délais | Fermeture puis reconnexion | Compatible | Moyenne | Retenir |
+| Abandon live | Sûr seulement si visible | Élevée / bonne | Bornée | Resync explicite | Compatible | Moyenne | Retenir sous condition |
+| File + retard + reconnexion | Forte et explicite | Élevée / forte | Bornée hors journal | Catch-up déterministe | Compatible | Moyenne-forte | Recommander |
+| Snapshot + rétention | Forte après replay validé | Élevée / bonne | Données chaudes bornées | Snapshot puis suffixe | Conditionnel | Forte | Différer puis retenir |
 
-## Proposed V0.2 contract
+## Contrat V0.2 proposé
 
-### 1. Authoritative command admission
+### 1. Admission des commandes autoritatives
 
-- Slow consumers never participate in the commit critical path.
-- The host has an explicit global bound on connections, admitted commands, and
-  concurrent catch-up work.
-- A command rejected before admission receives `server_overloaded` and creates
-  no canonical event or accepted-command receipt.
-- Once admitted to authoritative sequencing, a command reaches a durable
-  success or structured rejection independently of connection lifetime.
-- Once durably committed, a command remains accepted even if its submitting
-  connection closes before receiving an outcome. Existing `message_id`
-  deduplication recovers that outcome.
-- Disk exhaustion or persistence failure remains `persistence_failed`; it is
-  not converted into a successful command.
-- Limit values and admission timeouts are explicit configuration, not hidden
-  scheduler behavior.
+- Les consommateurs lents ne participent jamais au chemin critique du commit.
+- L’hôte borne connexions, commandes admises et catch-ups concurrents.
+- `server_overloaded` avant admission ne crée aucun fait ni reçu canonique.
+- Une commande admise atteint succès durable ou rejet structuré
+  indépendamment de la connexion.
+- Un commit durable reste accepté après fermeture ; la déduplication par
+  `message_id` récupère le résultat.
+- Épuisement disque et échec de persistance restent `persistence_failed`.
+- Limites et délais sont une configuration explicite.
 
-This bounds authoritative pressure through explicit admission or rejection,
-not by waiting for every client to consume notifications.
+### 2. Sortie par connexion
 
-### 2. Per-connection output
+- Chaque connexion possède une file de données bornée et un writer.
+- La borne porte sur le nombre et les octets sérialisés.
+- La publication canonique effectue un enqueue non bloquant.
+- Un chemin de contrôle réservé peut annuler le writer et tenter une fermeture.
+- Écritures et fermeture ont une échéance.
+- Dépassement ou timeout produit exactement une transition
+  `live -> resync_required -> closed`.
 
-- Each connection owns one bounded data queue and one writer task.
-- The queue is bounded by both message count and serialized bytes, using the
-  exact encoded size or a conservative upper bound. Item count alone is
-  insufficient because one catch-up page can be large.
-- Canonical publication performs a non-blocking enqueue. It never awaits a
-  connection's WebSocket sink.
-- A reserved control path can cancel the writer and attempt a final
-  protocol-level close even when the data queue is full.
-- Every write and close attempt has a deadline. Deadline expiry aborts the
-  connection task and releases its quota.
-- Exceeding queue count, byte budget, or write deadline moves the connection
-  exactly once from `live` to `resync_required`, then to `closed`.
+### 3. Livraison et curseurs
 
-### 3. Delivery and cursors
+- Publication, mise en file, écriture socket, réception, application et
+  persistance client sont des états distincts.
+- Le serveur ne prétend pas livrer de bout en bout et n’avance aucun curseur
+  confirmé lors d’une simple écriture.
+- Le curseur appartient au client : plus haute séquence contiguë appliquée et
+  persistée durablement.
+- Toute fermeture impose une reconnexion depuis ce curseur ; les doublons sont
+  traités selon INV-006.
+- `sent_sequence` reste un curseur local d’ordonnancement, pas un accusé.
 
-- `published`, `enqueued`, `written to a WebSocket sink`, `received`, `applied`,
-  and `persisted by the client` are distinct states.
-- The server does not claim end-to-end delivery and does not advance a
-  client-confirmed cursor merely when it enqueues or writes an event.
-- The recovery cursor is owned by the client and means **highest contiguous
-  sequence applied and durably persisted locally**.
-- On every connection, including an unexplained close, the client reconnects
-  with that durable cursor. It may receive duplicates and must process them
-  according to INV-006.
-- The current server-side `sent_sequence` remains only a connection-local
-  scheduling cursor. It is not a delivery acknowledgement.
+### 4. Comportement observable d’un consommateur lent
 
-### 4. Observable slow-consumer behavior
-
-- The preferred protocol signal is
+- Signal préféré :
   `ResyncRequired { reason, current_sequence, earliest_available_sequence,
-  snapshot_revision }`, followed by a WebSocket close with a stable SYTOG close
-  code and short reason.
-- Reasons include `outbound_queue_full`, `outbound_byte_budget_exceeded`,
-  `write_timeout`, `catch_up_limit_exceeded`, and `cursor_before_retention`.
-- Delivery of the final signal is best effort because a broken or blocked
-  transport cannot acknowledge it. Therefore any transport close has the same
-  safe client rule: persist the current replica, reconnect, and announce its
-  durable applied cursor.
-- The server never skips a range and then resumes live events on the same
-  connection as though continuity had been preserved.
+  snapshot_revision }`, puis fermeture WebSocket stable.
+- Raisons : `outbound_queue_full`, `outbound_byte_budget_exceeded`,
+  `write_timeout`, `catch_up_limit_exceeded`, `cursor_before_retention`.
+- Le signal final est best effort ; toute fermeture applique la même règle :
+  persister le réplica, reconnecter, annoncer le curseur durable.
+- Le serveur ne saute jamais une plage avant de reprendre le live sur la même
+  connexion comme si la continuité était préservée.
 
 ### 5. Catch-up
 
-- Catch-up is paginated. Every page is bounded by event count and serialized
-  bytes, and identifies `from_sequence`, `through_sequence`,
-  `current_sequence`, and whether more pages remain.
-- The server bounds concurrent catch-ups, pages per request, total events,
-  total bytes, wall-clock duration, and write duration.
-- A page always contains one contiguous canonical range. Page boundaries do
-  not change replay results.
-- Live notification delivery does not overtake unfinished catch-up on the same
-  connection. The connection catches up to a captured high-water mark, then
-  reconciles events committed after that mark before entering `live`.
-- Exceeding a catch-up budget closes the connection with
-  `catch_up_limit_exceeded`; the cursor is not advanced by the server.
-- A client may reconnect and continue from the last page it durably applied.
+- Le catch-up est paginé et chaque page bornée en événements et octets expose
+  `from_sequence`, `through_sequence`, `current_sequence` et sa terminalité.
+- Le serveur borne concurrence, pages, événements, octets et durées.
+- Chaque page est une plage canonique contiguë.
+- Le live ne dépasse pas un catch-up inachevé ; la connexion atteint un high
+  water mark puis réconcilie le suffixe avant `live`.
+- Dépasser un budget ferme avec `catch_up_limit_exceeded`.
+- Le client peut reprendre depuis la dernière page appliquée durablement.
 
-### 6. Retention, snapshots, and replay
+### 6. Rétention, snapshots et replay
 
-- The durable canonical archive and the hot catch-up window are separate
-  concepts.
-- The first implementation keeps the complete append-only archive and bounds
-  only live queues, concurrent work, and page sizes.
-- Before hot retention is bounded, SYTOG must implement and validate replay
-  from `snapshot at N + contiguous suffix N+1..current`.
-- After that milestone the server advertises an
-  `earliest_available_sequence`. A cursor at or above the floor receives event
-  pages. A cursor below the floor receives a compatible snapshot plus suffix,
-  or `ResyncRequired` if no compatible snapshot can be served within limits.
-- Destructive deletion of the only exact replay source is outside this ADR.
-  Archive retention, export, and deletion require a separate policy decision.
+- Archive canonique durable et fenêtre chaude sont distinctes.
+- La première implémentation conserve l’archive append-only complète.
+- Avant toute rétention chaude bornée, valider `snapshot N + suffixe
+  N+1..courant`.
+- Ensuite, annoncer `earliest_available_sequence` ; servir les pages au-dessus
+  du plancher, sinon snapshot compatible plus suffixe ou `ResyncRequired`.
+- La suppression destructive de l’unique source exacte reste hors de cet ADR.
 
-### 7. Voluntarily slow or hostile clients
+### 7. Clients volontairement lents ou hostiles
 
-- Connection admission uses a global semaphore and may later add per-address
-  quotas after identities and proxy trust are defined.
-- Handshake, idle reads, writes, and catch-up have deadlines.
-- Input messages, envelope bytes, catch-up frequency, and concurrent requests
-  are bounded.
-- A client cannot reserve unbounded output memory, retain a task forever, or
-  force unlimited catch-up cloning.
-- Repeated overload may be rate-limited, but policy must not alter canonical
-  event history or silently suppress an accepted command outcome.
+- L’admission utilise un sémaphore global ; les quotas par adresse attendent
+  une identité et une confiance proxy définies.
+- Handshake, lectures inactives, écritures et catch-up ont des échéances.
+- Messages, octets, fréquence et concurrence sont bornés.
+- Un client ne peut réserver mémoire, tâche ou clonage sans borne.
+- La limitation répétée ne change jamais l’historique canonique ni ne masque
+  le résultat d’une commande acceptée.
 
-## Client-observable state machine
+## Machine à états observable par le client
 
-| State | Server behavior | Client-visible outcome | Required client action |
+| État | Comportement serveur | Résultat client | Action requise |
 |---|---|---|---|
-| `connecting` | Validate limits and durable cursor | `Hello` accepted, catch-up plan, or explicit rejection | Keep local cursor unchanged |
-| `catching_up` | Send bounded contiguous pages | Page metadata and events | Validate, apply, persist, then request/accept next page |
-| `live` | Enqueue bounded live batches | Ordered events while connection keeps up | Apply and persist contiguously |
-| `resync_required` | Stop normal event enqueue; attempt notice and close | `ResyncRequired`, close reason, or unexplained close | Reconnect from last durably applied cursor |
-| `full_resync` | Serve compatible snapshot plus bounded suffix | Snapshot revision and suffix plan | Validate snapshot identity, replace local base, persist, then apply suffix |
-| `rejected` | Admit no work | Stable overload/error code | Retry with bounded backoff; do not assume a command committed |
+| `connecting` | Valide limites et curseur | `Hello` accepté, plan ou rejet | Garder le curseur |
+| `catching_up` | Pages bornées contiguës | Métadonnées et événements | Valider, appliquer, persister |
+| `live` | Met en file les lots live | Événements ordonnés | Appliquer et persister |
+| `resync_required` | Arrête le live, tente signal et fermeture | Signal, motif ou fermeture inexpliquée | Reconnecter au curseur durable |
+| `full_resync` | Snapshot compatible puis suffixe | Snapshot et plan | Remplacer la base puis appliquer |
+| `rejected` | N’admet aucun travail | Code stable | Retry borné, ne pas supposer le commit |
 
-For command submission, a transport close leaves the outcome unknown. The
-client retries the same request with the same `message_id`; durable
-deduplication returns the accepted result or allows a previously unaccepted
-request to be evaluated.
+Après fermeture pendant une soumission, le résultat est inconnu. Le client
+réessaie avec le même `message_id` ; la déduplication durable retrouve le
+résultat accepté ou évalue une requête jamais admise.
 
-## Invariant impact after full implementation
+## Impact sur les invariants après implémentation complète
 
-### Guaranteed
+### Garantis
 
-- A slow connection cannot block authoritative commit indefinitely.
-- Every connection has explicit queue, byte, and write-time bounds.
-- Queue overflow or write timeout cannot be hidden as continuous delivery.
-- Catch-up pages are contiguous and bounded.
-- A client resumes only from its own durable contiguous cursor.
-- An accepted command remains recoverable by `message_id` after disconnect.
-- Overload rejection before admission creates no canonical fact.
+- Une connexion lente ne bloque pas indéfiniment le commit autoritatif.
+- Chaque connexion possède des bornes de file, octets et temps d’écriture.
+- Dépassement et timeout ne sont jamais masqués comme livraison continue.
+- Les pages sont contiguës et bornées.
+- Le client reprend seulement depuis son curseur durable contigu.
+- Une commande acceptée reste récupérable par `message_id`.
+- Un rejet avant admission ne crée aucun fait canonique.
 
-### Limited
+### Limités
 
-- Catch-up is available only from the retained floor or a compatible snapshot.
-- Availability under overload is limited: the host may reject commands or
-  connections explicitly.
-- End-to-end delivery cannot be guaranteed without client acknowledgements;
-  the protocol guarantees deterministic recovery instead.
-- Total durable storage remains unbounded until an archive-retention policy is
-  chosen.
+- Le catch-up dépend du plancher retenu ou d’un snapshot compatible.
+- Sous surcharge, l’hôte peut refuser explicitement.
+- Sans accusé client, la livraison de bout en bout n’est pas garantie.
+- Le stockage durable total reste non borné avant politique d’archive.
 
-### Impossible under conflicting requirements
+### Impossibles sous exigences contradictoires
 
-- Arbitrary historical catch-up, finite local retention, and no external
-  archive cannot all be guaranteed simultaneously.
-- A final close reason cannot be guaranteed to reach a peer whose transport is
-  already blocked or broken.
-- Strict bounded total memory is impossible while the complete journal,
-  accepted-command index, and unbounded canonical state remain resident.
+- Catch-up historique arbitraire, rétention locale finie et absence d’archive
+  externe ne peuvent coexister.
+- Un motif final ne peut être garanti sur un transport déjà bloqué ou rompu.
+- La mémoire totale ne peut être strictement bornée tant que journal, index et
+  état canonique restent intégralement résidents.
 
-## Implementation plan
+## Plan d’implémentation
 
-1. **Protocol vocabulary only.** Add stable overload reasons,
-   `ResyncRequired`, paged `EventBatch` metadata, and tests for round-trip,
-   unknown versions, contiguous ranges, and close semantics.
-2. **Per-connection writer isolation.** Split reading from writing, add a
-   bounded count-and-byte queue, write timeout, reserved shutdown path, and
-   deterministic queue-overflow tests. Keep the complete journal.
-3. **Connection and authoritative admission.** Add global connection,
-   command-waiter, and catch-up semaphores with explicit rejection codes and
-   cancellation tests. Preserve commit and deduplication semantics.
-4. **Paged catch-up over the existing archive.** Introduce high-water marks,
-   page limits, total catch-up budgets, and live-transition tests. Avoid
-   cloning the whole suffix.
-5. **Snapshot resync.** Make `StateSnapshot` operational, validate
-   snapshot-plus-suffix replay, and add `earliest_available_sequence`
-   negotiation. Still retain the archive.
-6. **Hot-window retention.** Move the hot suffix out of the unbounded canonical
-   `Vec`, segment durable storage, and serve pages without loading the complete
-   archive. Keep exact archived replay.
-7. **Retention policy.** Decide archive export, duration, byte quota, and
-   deletion separately. Only then enable compaction that can remove local
-   history.
-8. **Operational hardening.** Add metrics and structured logs for queue
-   occupancy, lag transitions, disconnect reasons, catch-up pages and bytes,
-   admission rejections, write timeouts, and retention-floor resyncs.
+1. **Vocabulaire protocolaire seulement.** Raisons stables,
+   `ResyncRequired`, pages et tests.
+2. **Isolation du writer par connexion.** File bornée en nombre et octets,
+   timeout, chemin de fermeture réservé et tests de dépassement.
+3. **Admission des connexions et du travail autoritatif.** Sémaphores globaux
+   et codes de rejet, sans changer commit ni déduplication.
+4. **Catch-up paginé sur l’archive existante.** High-water marks, limites de
+   page et budgets totaux, sans cloner tout le suffixe.
+5. **Resync par snapshot.** Rendre `StateSnapshot` opérationnel, valider
+   snapshot-plus-suffixe et négocier `earliest_available_sequence`.
+6. **Rétention de fenêtre chaude.** Segmenter le stockage et servir sans charger
+   l’archive complète, tout en conservant le replay archivé exact.
+7. **Politique de rétention.** Décider export, durée, quota et suppression avant
+   tout compactage destructif.
+8. **Durcissement opérationnel.** Métriques et logs sur files, retards,
+   fermetures, pages, octets, rejets, timeouts et planchers.
 
-Each slice must keep the previous protocol readable or explicitly bump the
-protocol version. No slice may silently reinterpret an old cursor.
+Chaque tranche garde les anciennes versions lisibles ou augmente explicitement
+la version. Aucun curseur ancien n’est réinterprété silencieusement.
 
-## Required tests
+## Tests exigés
 
-### Property and invariant tests
+### Tests de propriété et d’invariants
 
-- Accepted command order and journal contents are independent of one stalled
-  output queue.
-- Queue occupancy and accounted bytes never exceed configured bounds.
-- Exactly one transition to `resync_required` occurs per overloaded connection.
-- No event after a dropped range is exposed as continuous live delivery.
-- Every catch-up page is non-empty, contiguous, ordered, and within both count
-  and byte limits.
-- Concatenating all pages equals the canonical suffix exactly.
-- Page size and timing do not affect the final reduced state.
-- A high-water-mark handoff cannot lose or duplicate facts across
-  `catching_up -> live`.
-- Reconnecting from every cursor in a generated journal converges, or produces
-  an explicit snapshot/full-resync requirement.
-- Retrying a command with the same `message_id` after disconnect returns the
-  durable accepted outcome without another append.
-- Admission rejection produces no event, receipt, revision change, or
-  broadcast.
-- Snapshot plus retained suffix replays to exactly the same state and revision
-  as the full archive.
+- Ordre accepté et journal indépendants d’une file bloquée.
+- Occupation et octets n’excèdent jamais les bornes.
+- Une seule transition `resync_required` par connexion surchargée.
+- Aucun événement après une plage perdue n’est présenté comme continu.
+- Pages non vides, contiguës, ordonnées et bornées.
+- La concaténation des pages égale exactement le suffixe canonique.
+- Taille et timing des pages ne changent pas l’état final.
+- Le passage `catching_up -> live` ne perd ni ne duplique.
+- Tout curseur converge ou exige explicitement snapshot/resync complet.
+- Retry du même `message_id` après fermeture sans second append.
+- Rejet d’admission sans événement, reçu, révision ou broadcast.
+- Snapshot plus suffixe égal au replay de l’archive complète.
 
-### Load and failure scenarios
+### Scénarios de charge et de panne
 
-- One non-reading WebSocket client while healthy clients submit and receive.
-- Many slow clients up to and beyond the connection quota.
-- Oversized event and batch attempts against the byte budget.
-- Writer blocked past its deadline.
-- Broadcast lag during concurrent paged catch-up.
-- Catch-up from the retention floor, one event before it, and sequence zero.
-- Disconnect after enqueue, during write, after write, and after client apply
-  but before local persistence.
-- Host restart during every catch-up page boundary.
-- Disk-full and append-failure injection while clients are overloaded.
-- Reconnect storms with bounded backoff and catch-up concurrency.
-- Long sessions demonstrating bounded hot memory and stable command latency.
+- Un client WebSocket qui ne lit pas pendant que les autres progressent.
+- De nombreux clients lents jusqu’au-delà du quota.
+- Événements et lots surdimensionnés.
+- Writer bloqué au-delà de son délai.
+- Retard broadcast pendant un catch-up concurrent.
+- Catch-up au plancher, juste avant et depuis zéro.
+- Déconnexion à chaque frontière d’enqueue, écriture, application et persistance.
+- Redémarrage de l’hôte à chaque frontière de page.
+- Disque plein et échec d’append sous surcharge.
+- Tempêtes de reconnexion avec backoff et concurrence bornés.
+- Sessions longues démontrant mémoire chaude et latence stables.
 
-## Human decisions required before implementation
+## Décisions humaines requises avant implémentation
 
-1. Numeric defaults and configurability for:
-   - maximum connections and command waiters;
-   - per-connection messages and serialized bytes;
-   - write, handshake, idle, and catch-up deadlines;
-   - catch-up page events/bytes and total session events/bytes;
-   - concurrent catch-ups and retry guidance.
-2. Whether the first protocol change remains wire-compatible V1 or requires a
-   protocol-version bump.
-3. The stable protocol message, WebSocket close code, and retry semantics for
-   slow-consumer and server-overload outcomes.
-4. Whether clients explicitly acknowledge durable application, or whether the
-   client-owned reconnect cursor remains the only confirmation.
-5. What constitutes a compatible snapshot and whether full resync may discard
-   locally retained event identity history.
-6. The distinction between hot retention and audit archive, including archive
-   export, retention duration, byte quota, and deletion authority.
-7. Whether admission limits are per host, per session, per authenticated
-   identity, or per network address once identity and proxy trust exist.
+1. Valeurs et configuration des limites de connexions, commandes, files, octets,
+   délais, pages, budgets et catch-ups concurrents.
+2. Compatibilité V1 ou nouvelle version du premier changement protocolaire.
+3. Messages, code WebSocket et retry stables pour lenteur et surcharge.
+4. Accusé durable serveur ou seul curseur de reconnexion appartenant au client.
+5. Définition d’un snapshot compatible et traitement de l’historique local.
+6. Distinction fenêtre chaude/archive, export, durée, quota et autorité de
+   suppression.
+7. Portée des limites : hôte, session, identité ou adresse réseau.
 
-## Consequences
+## Conséquences
 
-The authoritative path remains stable when one client is slow, while the host
-may still reject new global work explicitly to protect itself. Clients gain a
-simple safe rule: persist only contiguous applied facts, never infer delivery
-from connection lifetime, and reconnect from that cursor after any close.
+Le chemin autoritatif reste stable lorsqu’un client ralentit, tandis que l’hôte
+peut refuser explicitement du nouveau travail global. La règle client est
+simple : ne persister que des faits contigus appliqués, ne jamais inférer la
+livraison de la durée de connexion et reconnecter depuis ce curseur.
 
-The design adds protocol states, queue accounting, deadlines, and operational
-limits. It intentionally accepts disconnection and retry as normal flow. Exact
-replay remains the authority; live delivery is a bounded optimization.
+Le design ajoute états protocolaires, comptage de file, délais et limites. Il
+accepte déconnexion et retry comme flux normal. Le replay exact reste
+l’autorité ; le live est une optimisation bornée.
 
-Journal compaction is not an immediate backpressure fix. It becomes safe only
-after snapshot-plus-suffix replay and archive policy are separately validated.
+Le compactage n’est pas une correction immédiate de backpressure. Il ne devient
+sûr qu’après validation du replay snapshot-plus-suffixe et d’une politique
+d’archive séparée.

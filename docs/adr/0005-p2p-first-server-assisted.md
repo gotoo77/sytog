@@ -1,9 +1,14 @@
-# ADR 0005: P2P-first, server-assisted
+Langue canonique : Français
 
-Status: accepted
+English version: [English](0005-p2p-first-server-assisted.en.md)
 
-The architecture must permit direct peers and LAN/self-hosted use while allowing
-signaling, relay, and WebSocket fallback. No transport is privileged in the
-domain, and V0 implements none because an in-memory deterministic slice is
-enough to test semantics.
+[Français](0005-p2p-first-server-assisted.md) | [English](0005-p2p-first-server-assisted.en.md)
 
+# ADR 0005 : P2P d’abord, assisté par serveur
+
+Statut : accepté
+
+L’architecture doit permettre les pairs directs et l’usage LAN ou auto-hébergé,
+tout en autorisant la signalisation, le relais et un repli WebSocket. Aucun
+transport n’est privilégié dans le domaine, et la V0 n’en implémente aucun car
+une tranche déterministe en mémoire suffit à tester la sémantique.
