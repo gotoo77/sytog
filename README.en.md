@@ -35,6 +35,13 @@ fixtures/              stable V0 protocol, log, job, and node contracts
 docs/                  architecture, ADRs, guides, threat model, and roadmap
 ```
 
+### Crate map
+
+![SYTOG crate architecture](docs/assets/sytog-crates-overview.png)
+
+_Arrows indicate dependencies between crates. Module descriptions use the
+canonical French terminology._
+
 No empty transport or storage crates are present. Those adapters should appear
 only when a real scenario needs them.
 
