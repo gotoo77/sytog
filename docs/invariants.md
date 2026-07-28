@@ -586,6 +586,39 @@ Une écriture réseau lente bloque sa tâche de connexion, mais pas explicitemen
 le producteur canonique. Aucune borne de mémoire, de connexion, de taille de
 lot, de délai d’écriture ou de service n’est garantie.
 
+**Contrat proposé, partiellement typé mais non appliqué.** La tranche
+protocolaire de l’[ADR 0008](adr/0008-overload-and-backpressure-contract.md)
+définit des enveloppes V2 distinctes, `ResyncRequired`, des raisons stables, un
+rejet avant admission et les métadonnées validées d’un catch-up paginé. Le nœud
+continue toutefois d’émettre et traiter V1 : aucune limite d’exécution décrite
+ci-dessous n’est encore active. L’ADR sépare quatre domaines de pression :
+
+- admission autoritative globale bornée, avec rejet `server_overloaded` avant
+  tout fait canonique, mais sans attente d’un consommateur après admission ;
+- file de sortie par connexion bornée en nombre **et** en octets, écrite par
+  une tâche dédiée avec timeout ;
+- dépassement de file ou timeout transformé en `ResyncRequired`, puis fermeture
+  explicite ; toute fermeture impose une reconnexion depuis la dernière
+  séquence contiguë appliquée et persistée par le client ;
+- catch-up paginé, borné en événements, octets, durée et concurrence, sans
+  entrelacement invisible avec le flux live ;
+- distinction entre archive canonique durable, fenêtre chaude de rattrapage et
+  snapshots ; aucun compactage destructif avant validation du replay
+  snapshot-plus-suffixe ;
+- resync complet explicite lorsqu’un curseur précède la rétention disponible.
+
+Ce contrat ne promet pas la livraison de bout en bout. Il promet qu’aucune
+perte de notification ou reprise ne sera présentée comme une continuité
+livrée : le curseur de récupération appartient au client et représente
+uniquement les faits appliqués contigus qu’il a persistés localement.
+
+**Critère de reclassement.** INV-012 reste `Réfuté / limité` tant que les bornes
+de connexion, admission, file, octets, écriture et catch-up ne sont pas
+implémentées et testées. Il restera au moins `Limité` tant que le journal
+complet, l’index des commandes acceptées ou l’état canonique peuvent croître
+sans borne. Rétention locale finie, rattrapage historique arbitraire et absence
+d’archive externe ne peuvent pas être garantis simultanément.
+
 **Tests existants.**
 
 - `persisted_old_replica_catches_up_large_suffix_after_host_restart` observe un
@@ -614,5 +647,6 @@ comportement lors du dépassement des 256 lots.
    INV-012 demeure réfuté / limité.
 
 Les cinq expériences de rupture sont maintenant caractérisées. La prochaine
-étape n’est plus une mesure exploratoire : elle exige de choisir un contrat de
-surcharge explicite avant toute correction de production.
+étape n’est plus une mesure exploratoire : elle exige la validation humaine des
+limites et choix protocolaires de l’ADR 0008 avant toute correction de
+production.

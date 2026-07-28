@@ -8,7 +8,14 @@ use sytog_domain::{MessageId, ParticipantId, SessionEvent, SessionId, SessionSta
 use thiserror::Error;
 
 pub const PROTOCOL_FAMILY: &str = "sytog";
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION_V1: u16 = 1;
+pub const PROTOCOL_VERSION_V2: u16 = 2;
+pub const LATEST_PROTOCOL_VERSION: u16 = PROTOCOL_VERSION_V2;
+/// Wire version emitted by the current host and client implementation.
+pub const ACTIVE_SERVER_PROTOCOL_VERSION: u16 = PROTOCOL_VERSION_V1;
+/// Compatibility version used by the existing journal, snapshots, and V1
+/// transport path. New wire code must select V1 or V2 explicitly.
+pub const PROTOCOL_VERSION: u16 = ACTIVE_SERVER_PROTOCOL_VERSION;
 pub const EVENT_LOG_SCHEMA_VERSION: u16 = 1;
 pub const SNAPSHOT_SCHEMA_VERSION: u16 = 1;
 
@@ -123,7 +130,7 @@ fn validate_identifier(value: &str, field: &'static str) -> Result<(), ProtocolE
 }
 
 impl Envelope {
-    /// Validates the stable V0 envelope header.
+    /// Validates a supported V1 or V2 envelope header.
     ///
     /// # Errors
     ///
@@ -133,7 +140,7 @@ impl Envelope {
         if self.family != PROTOCOL_FAMILY {
             return Err(ProtocolError::UnknownFamily(self.family.clone()));
         }
-        if self.version != PROTOCOL_VERSION {
+        if !matches!(self.version, PROTOCOL_VERSION_V1 | PROTOCOL_VERSION_V2) {
             return Err(ProtocolError::UnsupportedVersion(self.version));
         }
         if self.message_type.trim().is_empty() {
@@ -204,6 +211,33 @@ mod tests {
             envelope.validate(),
             Err(ProtocolError::UnsupportedVersion(99))
         );
+    }
+
+    #[test]
+    fn v1_fixture_remains_a_supported_envelope() {
+        let envelope: Envelope =
+            serde_json::from_str(include_str!("../../../fixtures/protocol/envelope-v1.json"))
+                .expect("V1 fixture deserializes");
+        assert_eq!(envelope.version, PROTOCOL_VERSION_V1);
+        envelope.validate().expect("V1 envelope remains supported");
+    }
+
+    #[test]
+    fn v2_envelope_header_is_supported_without_reinterpreting_its_payload() {
+        assert_eq!(ACTIVE_SERVER_PROTOCOL_VERSION, PROTOCOL_VERSION_V1);
+        assert_eq!(PROTOCOL_VERSION, ACTIVE_SERVER_PROTOCOL_VERSION);
+        assert_eq!(LATEST_PROTOCOL_VERSION, PROTOCOL_VERSION_V2);
+        let envelope = Envelope {
+            family: PROTOCOL_FAMILY.to_owned(),
+            version: PROTOCOL_VERSION_V2,
+            message_id: MessageId::from("m2"),
+            session_id: SessionId::from("s1"),
+            sender_id: ParticipantId::from("p1"),
+            message_type: "resync_required".to_owned(),
+            revision: Some(12),
+            payload: Value::Null,
+        };
+        envelope.validate().expect("V2 header is supported");
     }
 
     #[test]

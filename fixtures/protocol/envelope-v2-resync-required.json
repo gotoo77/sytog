@@ -1,0 +1,18 @@
+{
+  "family": "sytog",
+  "version": 2,
+  "message_id": "resync-001",
+  "session_id": "demo-session",
+  "sender_id": "host",
+  "message_type": "resync_required",
+  "revision": 100,
+  "payload": {
+    "type": "resync_required",
+    "payload": {
+      "reason": "cursor_before_retention",
+      "earliest_available_sequence": 51,
+      "current_sequence": 100,
+      "snapshot_revision": 50
+    }
+  }
+}
