@@ -2613,6 +2613,86 @@ mod tests {
         fs::remove_dir_all(directory).expect("test directory can be removed");
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn saturated_broadcast_drops_old_batches_without_blocking_commits_and_recovers() {
+        const SATURATING_COMMAND_COUNT: usize = 300;
+
+        let (directory, config) = server_config("saturated-broadcast-recovery");
+        let host =
+            Arc::new(Host::load_or_create(&config, Arc::new(VoteActivity)).expect("host starts"));
+        let checkpoint_events = host.canonical.lock().await.events.clone();
+        let checkpoint_revision = host.current_revision().await;
+        let mut stale_replica = ClientReplica::uninitialized(config.session_id.clone());
+        for event in &checkpoint_events {
+            assert_eq!(
+                stale_replica
+                    .apply_received_event(event)
+                    .expect("checkpoint event applies"),
+                ReceivedEvent::Applied
+            );
+        }
+        let mut slow_subscription = host.events.subscribe();
+
+        tokio::time::timeout(ASYNC_TEST_TIMEOUT, async {
+            for index in 0..SATURATING_COMMAND_COUNT {
+                host.join(
+                    ParticipantId(format!("participant-{index}")),
+                    format!("Participant {index}"),
+                    MessageId(format!("join-{index}")),
+                )
+                .await
+                .expect("command commits while the subscriber does not read");
+            }
+        })
+        .await
+        .expect("commands finish before the test timeout");
+
+        let final_revision = host.current_revision().await;
+        assert_eq!(
+            final_revision - checkpoint_revision,
+            u64::try_from(SATURATING_COMMAND_COUNT).expect("command count fits")
+        );
+        let broadcast_outcome = tokio::time::timeout(ASYNC_TEST_TIMEOUT, slow_subscription.recv())
+            .await
+            .expect("broadcast outcome arrives before the test timeout");
+        let skipped = match broadcast_outcome {
+            Err(broadcast::error::RecvError::Lagged(skipped)) => skipped,
+            outcome => panic!("expected a lagged subscriber, got {outcome:?}"),
+        };
+        assert!(skipped > 0, "the bounded channel evicts old batches");
+
+        let recovered = host.events_after(checkpoint_revision).await;
+        assert_eq!(recovered.len(), SATURATING_COMMAND_COUNT);
+        assert_eq!(
+            recovered
+                .first()
+                .expect("suffix has a first event")
+                .sequence,
+            checkpoint_revision + 1
+        );
+        assert_eq!(
+            recovered.last().expect("suffix has a last event").sequence,
+            final_revision
+        );
+        for event in &recovered {
+            assert_eq!(
+                stale_replica
+                    .apply_received_event(event)
+                    .expect("recovered event applies"),
+                ReceivedEvent::Applied
+            );
+        }
+        assert_eq!(
+            stale_replica.state,
+            host.canonical.lock().await.state,
+            "journal recovery restores the complete canonical state"
+        );
+
+        drop(slow_subscription);
+        drop(host);
+        fs::remove_dir_all(directory).expect("test directory can be removed");
+    }
+
     #[test]
     fn truncated_legacy_final_line_recovers_valid_prefix() {
         let (directory, config) = server_config("truncated-legacy-final");

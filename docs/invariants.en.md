@@ -548,10 +548,14 @@ behavior.
 `events_after` filters and clones the whole requested suffix into a new `Vec`.
 The V1 client identity history also retains every event received after its base
 revision. A lagging receiver falls back to the same complete catch-up. There is
-no pagination, maximum window, compaction, quota, or overload rejection.
+also one task per accepted connection without a global or per-address quota.
+There is no pagination, maximum window, compaction, connection limit, write
+timeout, quota, or overload rejection.
 
-**Current enforcement point.**
+**Current enforcement points.**
 
+- unbounded connection-task creation in
+  [`serve`](../crates/sytog-node/src/lib.rs#L137-L169);
 - channel capacity in
   [`Host::load_or_create`](../crates/sytog-node/src/lib.rs#L526-L537);
 - recovery after `Lagged` in
@@ -559,13 +563,23 @@ no pagination, maximum window, compaction, quota, or overload rejection.
 - unbounded suffix clone in
   [`Host::events_after`](../crates/sytog-node/src/lib.rs#L712-L721).
 
-**Current behavior under pressure.** The in-memory journal grows with the
-session. An old catch-up allocates in proportion to the suffix. A slow client
-may lag; its task then tries to clone and send every missing event. No service
-bound is guaranteed.
+**Current behavior under pressure.** Sending to the channel does not wait for
+subscribers: commits continue and the oldest batches are evicted for a slow
+receiver. On its next `recv`, that receiver observes `Lagged`, clones the whole
+missing suffix under the canonical lock, then attempts to send it as one
+`EventBatch`. The in-memory journal and client history grow with the session;
+catch-up cloning and serialization grow with the suffix. A slow network write
+blocks its connection task, but does not explicitly block the canonical
+producer. No memory, connection, batch-size, write-time, or service bound is
+guaranteed.
 
-**Existing tests.** No load, slow-client, saturated-channel, or very-old-client
-test exists.
+**Existing tests.**
+
+- `persisted_old_replica_catches_up_large_suffix_after_host_restart` observes
+  one 276-event batch;
+- `saturated_broadcast_drops_old_batches_without_blocking_commits_and_recovers`
+  leaves one subscriber idle across 300 commits, observes `Lagged`, then
+  verifies contiguous recovery of all 300 events and convergence.
 
 **Reproducible breaking attempt.** Produce a large journal, keep one client
 from reading its socket, then request from sequence zero with a second client.
@@ -582,8 +596,10 @@ batches.
    durability are characterized.
 4. **Old reconnection — complete**: a persisted replica catches up after host
    restart over a suffix larger than the broadcast channel capacity.
-5. **Pressure and backpressure — next**: measure bounds now that the previous
-   semantics are characterized.
+5. **Pressure and backpressure — characterized**: the producer does not slow
+   down, the channel evicts old batches, and complete catch-up remains
+   unbounded; INV-012 remains refuted / limited.
 
-The first four families now protect canonical-journal identity, recovery,
-ordering, and catch-up. Pressure and backpressure are the next experiment.
+All five breaking experiments are now characterized. The next step is no
+longer exploratory measurement: it requires choosing an explicit overload
+contract before changing production code.
