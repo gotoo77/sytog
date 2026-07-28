@@ -1,27 +1,19 @@
 [package]
-name = "sytog-cli"
+name = "sytog-transport"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
-[[bin]]
-name = "sytog"
-path = "src/main.rs"
-
 [dependencies]
-clap.workspace = true
+futures-util.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-sytog-capabilities = { path = "../sytog-capabilities" }
 sytog-domain = { path = "../sytog-domain" }
-sytog-demo-counter = { path = "../sytog-demo-counter" }
-sytog-demo-vote = { path = "../sytog-demo-vote" }
-sytog-node = { path = "../sytog-node" }
 sytog-protocol = { path = "../sytog-protocol" }
-sytog-runtime = { path = "../sytog-runtime" }
 thiserror.workspace = true
 tokio.workspace = true
+tokio-tungstenite.workspace = true
 
 [lints]
 workspace = true
