@@ -2,10 +2,11 @@
 
 # Invariants et propriétés de SYTOG
 
-Ce document est la carte vérifiable des propriétés de SYTOG à la baseline
-`v0.2.0`. Il décrit ce que le système impose, ce que les tests ont seulement
-démontré, ce qui reste une cible et les limites déjà connues. Il ne constitue
-pas une promesse générale au-delà des périmètres et hypothèses indiqués.
+Ce document est la carte vérifiable des propriétés de SYTOG depuis la baseline
+`v0.2.0`, mise à jour au fil des expériences de hardening. Il décrit ce que le
+système impose, ce que les tests ont seulement démontré, ce qui reste une cible
+et les limites déjà connues. Il ne constitue pas une promesse générale au-delà
+des périmètres et hypothèses indiqués.
 
 ## Statuts
 
@@ -29,8 +30,8 @@ nécessairement pour un événement réseau que le client ignore avant validatio
 | INV-003 | Répétabilité de `causation_id` | Garanti |
 | INV-004 | Replay déterministe avec la même implémentation | Démontré |
 | INV-005 | Convergence sémantique des réplicas clients | Démontré |
-| INV-006 | Traitement sûr des événements dupliqués | Réfuté / limité |
-| INV-007 | Déduplication durable des commandes | Cible |
+| INV-006 | Traitement sûr des événements dupliqués | Garanti |
+| INV-007 | Déduplication durable des commandes acceptées | Garanti |
 | INV-008 | Linéarisation par l’hôte autoritaire | Garanti |
 | INV-009 | Récupération d’une dernière ligne JSONL partielle | Réfuté / limité |
 | INV-010 | Refus d’une corruption JSONL intermédiaire | Garanti |
@@ -60,7 +61,7 @@ ne dit rien d’un fichier JSONL qui n’a pas encore été chargé et validé.
 - [`SessionState::apply`](../crates/sytog-domain/src/lib.rs#L107-L131) refuse
   toute autre séquence ;
 - le nœud valide le journal prospectif avant persistance dans
-  [`Host::commit`](../crates/sytog-node/src/lib.rs#L520-L557).
+  [`Host::commit`](../crates/sytog-node/src/lib.rs#L630-L697).
 
 **Comportement en cas de violation.** Le validateur retourne
 `UnexpectedEventSequence`, ou le réducteur retourne `UnexpectedSequence`.
@@ -91,7 +92,7 @@ append. Elle ne couvre pas le chemin client décrit par INV-006.
 - l’ensemble `event_ids` de
   [`EventLogV0::validate`](../crates/sytog-protocol/src/lib.rs#L51-L70) ;
 - la validation prospective de
-  [`Host::commit`](../crates/sytog-node/src/lib.rs#L526-L543) avant écriture.
+  [`Host::commit`](../crates/sytog-node/src/lib.rs#L630-L681) avant écriture.
 
 **Comportement en cas de violation.** Le journal est refusé avec
 `ProtocolError::DuplicateEventId`. L’hôte transforme une collision prospective
@@ -184,17 +185,18 @@ JSONL incomplète, l’hôte devrait identifier avec certitude ce suffixe non co
 le retirer et reconstruire le dernier préfixe durable valide.
 
 **État actuel, hypothèses et périmètre.** Cette récupération n’existe pas.
-`load_events` désérialise toutes les lignes non vides et propage la première
-erreur JSON. Une dernière ligne tronquée bloque donc actuellement le
-redémarrage, comme toute autre corruption.
+`JournalStore::load` désérialise toutes les lignes non vides et propage la
+première erreur JSON. Une dernière ligne tronquée — événement V0 brut ou lot
+V1 de commandes acceptées — bloque donc actuellement le redémarrage, comme
+toute autre corruption.
 
 **Point d’application.**
 
 - lecture stricte dans
-  [`JournalStore::load_events`](../crates/sytog-node/src/lib.rs#L587-L601) ;
+  [`JournalStore::load`](../crates/sytog-node/src/lib.rs#L726-L784) ;
 - l’append écrit un lot puis appelle `sync_data` dans
-  [`JournalStore::append_events`](../crates/sytog-node/src/lib.rs#L603-L616),
-  sans framing ni marqueur de commit.
+  [`JournalStore::append_accepted`](../crates/sytog-node/src/lib.rs#L786-L801), sans
+  framing ni marqueur de commit.
 
 **Comportement en cas de violation.** Le chargement retourne `NodeError::Json`
 ou une erreur d’entrée/sortie. L’hôte ne démarre pas et ne tronque rien
@@ -204,16 +206,17 @@ automatiquement.
 
 **Tentative de rupture reproductible.** Copier un répertoire de session,
 tronquer les derniers octets de `events.jsonl` au milieu du dernier objet JSON,
-puis démarrer l’hôte sur la copie. En V0.2.0, le démarrage doit échouer : ce
-contre-exemple confirme la limite.
+puis démarrer l’hôte sur la copie. Dans l’état actuel, le démarrage doit
+échouer : ce contre-exemple confirme la limite.
 
 ### INV-010 — Refus d’une corruption JSONL intermédiaire
 
 **Statut : Garanti**
 
 **Énoncé exact.** Si une ligne non vide quelconque du journal JSONL ne peut pas
-être lue ou désérialisée comme `SessionEvent`, le chargement échoue. Aucun
-suffixe suivant cette ligne n’est rejoué silencieusement.
+être lue ou désérialisée comme événement V0 brut ou lot V1 reconnu, le
+chargement échoue. Aucun suffixe suivant cette ligne n’est rejoué
+silencieusement.
 
 **Hypothèses et périmètre.** La garantie porte sur les erreurs visibles au
 lecteur de lignes et à `serde_json`. Une modification qui reste un JSON
@@ -222,10 +225,10 @@ réducteur.
 
 **Point d’application.**
 
-- la collecte en `Result<Vec<SessionEvent>, NodeError>` de
-  [`JournalStore::load_events`](../crates/sytog-node/src/lib.rs#L587-L601) ;
+- le chargement strict et la reconstruction de l’index dans
+  [`JournalStore::load`](../crates/sytog-node/src/lib.rs#L726-L784) ;
 - la validation et le replay complets dans
-  [`Host::load_or_create`](../crates/sytog-node/src/lib.rs#L397-L430).
+  [`Host::load_or_create`](../crates/sytog-node/src/lib.rs#L472-L525).
 
 **Comportement en cas de violation.** L’hôte refuse de démarrer. Il ne produit
 pas un état issu du seul préfixe valide et ne réécrit pas le journal.
@@ -240,41 +243,57 @@ Le démarrage doit échouer sans modifier la copie.
 
 ## Commandes, concurrence et durabilité
 
-### INV-007 — Déduplication durable des commandes
+### INV-007 — Déduplication durable des commandes acceptées
 
-**Statut : Cible**
+**Statut : Garanti**
 
-**Énoncé exact visé.** Pour une paire stable `(session_id, message_id)` déjà
+**Énoncé exact.** Pour une paire stable `(session_id, message_id)` déjà
 acceptée, toute nouvelle soumission de la même commande doit retourner le
 résultat accepté antérieurement sans décider, persister ni diffuser de nouveaux
 événements. Le même identifiant avec un contenu différent doit être une
 collision fatale ou un rejet structuré.
 
-**État actuel, hypothèses et périmètre.** Aucun registre durable des commandes
-et de leurs réponses n’existe. Une répétition après acceptation est souvent
-refusée indirectement par `expected_revision`, mais le système ne sait pas
-répondre « commande déjà connue » ni restituer sa réponse initiale.
+**Hypothèses et périmètre.** La garantie s’applique aux commandes acceptées
+écrites sous forme de lot versionné V1. Les lignes d’événements brutes produites
+par `v0.2.0` restent lisibles, mais ne contiennent pas la requête nécessaire
+pour dédupliquer rétrospectivement leurs commandes. L’identité compare tout le
+`CommandRequest`, y compris acteur, révision attendue et payload.
 
-**Point d’application actuel.**
+**Point d’application.**
 
 - `SubmitCommand` transporte le
   [`CommandRequest`](../crates/sytog-transport/src/lib.rs#L14-L41) ;
-- [`Host::submit`](../crates/sytog-node/src/lib.rs#L460-L503) vérifie la
-  révision puis redécide, sans index de `message_id` ;
-- les fichiers persistés ne contiennent que les événements, pas les réponses
-  de commandes.
+- [`Host::submit`](../crates/sytog-node/src/lib.rs#L546-L606) consulte l’index durable
+  avant le contrôle de révision ;
+- `AcceptedBatchV1` persiste dans une même ligne versionnée la requête acceptée
+  et la liste exacte des événements retournés ;
+- [`JournalStore::load`](../crates/sytog-node/src/lib.rs#L726-L784) reconstruit l’index
+  des commandes au redémarrage.
 
-**Comportement actuel en cas de répétition.** Selon la révision et l’état, la
-commande peut être refusée comme obsolète ou réévaluée. Aucune sémantique
-exactly-once durable n’est garantie.
+**Comportement en cas de répétition ou collision.**
 
-**Tests existants.** Aucun test de resoumission du même `message_id` après
-acceptation ou redémarrage.
+- même `message_id` et même requête acceptée : les événements antérieurs sont
+  retournés, sans nouvelle décision, écriture, révision ou diffusion globale ;
+- même `message_id` accepté avec une requête différente : rejet structuré
+  `command_id_collision` avant toute décision ;
+- une commande refusée n’est pas enregistrée : son identifiant peut être
+  réévalué, y compris après redémarrage. Ce choix est explicite et correspond à
+  la politique « seuls les faits acceptés appartiennent au journal canonique ».
 
-**Tentative de rupture reproductible.** Soumettre une commande acceptée,
-interrompre la connexion avant réception de sa réponse, redémarrer le client
-avec son ancienne révision et resoumettre exactement le même `message_id`.
-Observer qu’aucune réponse acceptée historique n’est disponible.
+**Tests existants.**
+
+- `accepted_command_is_deduplicated_without_new_events` ;
+- `accepted_command_id_with_different_content_is_rejected_explicitly` ;
+- `accepted_command_deduplication_survives_restart` ;
+- `rejected_command_id_can_be_reevaluated` ;
+- `host_loads_legacy_events_and_appends_versioned_acceptances`.
+
+**Tentative de rupture reproductible.** Soumettre une commande, conserver sa
+requête et ses événements, redémarrer l’hôte, puis resoumettre exactement la
+même requête. La révision et le journal doivent rester inchangés et la réponse
+doit contenir les mêmes événements. Modifier ensuite un seul champ de la
+requête en gardant `message_id` : l’hôte doit répondre
+`command_id_collision`.
 
 ### INV-008 — Linéarisation par l’hôte autoritaire
 
@@ -293,11 +312,11 @@ reproductible par replay.
 
 **Point d’application.**
 
-- verrou dans [`Host::join`](../crates/sytog-node/src/lib.rs#L441-L458) ;
+- verrou dans [`Host::join`](../crates/sytog-node/src/lib.rs#L527-L544) ;
 - verrou et contrôle de révision dans
-  [`Host::submit`](../crates/sytog-node/src/lib.rs#L460-L471) ;
+  [`Host::submit`](../crates/sytog-node/src/lib.rs#L546-L573) ;
 - validation, persistance et commit restent sous cette garde jusqu’à la fin de
-  [`Host::commit`](../crates/sytog-node/src/lib.rs#L520-L557).
+  [`Host::commit`](../crates/sytog-node/src/lib.rs#L630-L697).
 
 **Comportement en cas de concurrence.** Une commande gagne le verrou et peut
 être acceptée. Une autre commande portant la même `expected_revision` est
@@ -330,16 +349,17 @@ ne garantit pas l’atomicité physique du lot : une erreur ou un crash pendant
 
 **Point d’application.**
 
-- ordre de [`Host::commit`](../crates/sytog-node/src/lib.rs#L520-L557) ;
+- ordre de [`Host::commit`](../crates/sytog-node/src/lib.rs#L630-L697) ;
 - écriture et synchronisation dans
-  [`JournalStore::append_events`](../crates/sytog-node/src/lib.rs#L603-L616).
+  [`JournalStore::append_accepted`](../crates/sytog-node/src/lib.rs#L786-L801).
 
 **Comportement en cas de violation.** Une erreur d’append devient
 `persistence_failed` et empêche le commit mémoire et la diffusion. Si l’écriture
 a été partielle, le prochain redémarrage rencontre actuellement INV-009.
 
-**Tests existants.** Aucun test injectant un crash ou une erreur à chaque point
-de l’append. Le test de redémarrage ne couvre que le chemin de succès.
+**Tests existants.** Les tests de déduplication après redémarrage et de journal
+mixte V0/V1 couvrent le chemin de succès. Aucun test n’injecte encore un crash
+ou une erreur à chaque point de l’append.
 
 **Tentative de rupture reproductible.** Utiliser un stockage instrumenté qui
 échoue après N octets pour chaque valeur de N dans un lot multi-événements.
@@ -366,9 +386,9 @@ spécifiés comme sérialisation canonique.
 **Point d’application.**
 
 - réduction locale dans
-  [`connect_client`](../crates/sytog-node/src/lib.rs#L201-L240) ;
+  [`connect_client`](../crates/sytog-node/src/lib.rs#L253-L293) ;
 - flux canonique produit après commit dans
-  [`Host::commit`](../crates/sytog-node/src/lib.rs#L520-L557).
+  [`Host::commit`](../crates/sytog-node/src/lib.rs#L630-L697).
 
 **Comportement en cas de violation.** Les trous détectés déclenchent un
 catch-up. Aucune comparaison automatique de hash ou d’état avec l’hôte ne
@@ -388,37 +408,52 @@ vérifier que chaque écart est détecté plutôt que silencieusement réduit.
 
 ### INV-006 — Traitement sûr des événements dupliqués
 
-**Statut : Réfuté / limité**
+**Statut : Garanti**
 
-**Énoncé exact visé.** Un événement déjà appliqué doit être ignoré uniquement
+**Énoncé exact.** Un événement déjà appliqué doit être ignoré uniquement
 si son `event_id`, sa séquence et son contenu sont strictement identiques au
 fait canonique connu. Le même `event_id` ou la même séquence avec un contenu
 différent doit déclencher une violation d’invariant.
 
-**État actuel, hypothèses et périmètre.** Sur le chemin réseau client, tout
-événement dont `sequence <= local.revision` est ignoré sans comparer
-`event_id`, `causation_id`, acteur, portée ou payload. Un faux événement ancien
-avec un contenu différent peut donc être silencieusement ignoré. Le journal
-canonique complet reste protégé par INV-001 et INV-002.
+**Hypothèses et périmètre.** La garantie s’applique aux événements dont
+l’identité complète est présente dans l’historique V1 du client. Un ancien
+snapshot V0 ne contient que l’état et sa révision : un événement antérieur à
+son historique disponible est donc refusé avec
+`EventHistoryUnavailable`, jamais supposé identique. Le journal canonique reste
+en plus protégé par INV-001 et INV-002.
 
-**Point d’application actuel.**
+**Point d’application.**
 
-- branche d’ignorance dans
-  [`connect_client`](../crates/sytog-node/src/lib.rs#L205-L215) ;
-- aucune table locale des événements déjà appliqués n’est conservée dans le
-  snapshot client.
+- `ClientReplicaV1` persiste le snapshot, la révision de base de l’historique et
+  les événements connus ;
+- [`ClientReplica::apply_received_event`](../crates/sytog-node/src/lib.rs#L890-L933)
+  compare l’événement complet par séquence et recherche toute réutilisation de
+  `event_id` avant réduction ;
+- [`load_client_replica`](../crates/sytog-node/src/lib.rs#L944-L958) valide l’historique
+  versionné au redémarrage.
 
-**Comportement actuel en cas de doublon.** Une séquence ancienne est ignorée,
-qu’elle soit identique ou contradictoire. Une séquence future non contiguë
-déclenche un catch-up.
+**Comportement en cas de doublon ou collision.**
 
-**Tests existants.** Aucun test n’envoie au client un ancien événement modifié
-ou une collision d’identifiant via WebSocket.
+- événement strictement égal déjà connu : `AlreadySeen`, sans modification ;
+- même `event_id` avec contenu ou séquence différents :
+  `EventIdCollision` et arrêt fermé ;
+- même séquence avec un autre événement : `EventSequenceCollision` et arrêt
+  fermé ;
+- séquence ancienne non vérifiable faute d’historique :
+  `EventHistoryUnavailable` ;
+- séquence future non contiguë : demande de catch-up.
 
-**Tentative de rupture reproductible.** Amener un client à la révision N, puis
-lui envoyer un `EventBatch` contenant un événement de séquence N avec un
-`event_id` ou payload différent. En V0.2.0, le client l’ignore sans erreur : ce
-contre-exemple confirme la limite.
+**Tests existants.**
+
+- `identical_received_event_is_a_safe_noop` ;
+- `reused_event_id_with_different_content_is_rejected` ;
+- `old_sequence_with_different_content_is_rejected` ;
+- `received_event_identity_survives_client_restart`.
+
+**Tentative de rupture reproductible.** Amener un client V1 à la révision N,
+puis lui envoyer successivement l’événement canonique N, le même `event_id`
+avec un payload différent, puis un autre `event_id` à la séquence N. Seul le
+premier doit être un no-op ; les deux suivants doivent échouer explicitement.
 
 ### INV-011 — Reconnexion et rattrapage par séquence
 
@@ -437,9 +472,9 @@ suffixe et aucune compaction n’a supprimé les événements requis.
 - `Hello.last_sequence` et `CatchUpRequest.after_sequence` dans
   [`NetworkMessage`](../crates/sytog-transport/src/lib.rs#L14-L41) ;
 - réponse au hello et au catch-up dans
-  [`handle_connection`](../crates/sytog-node/src/lib.rs#L297-L357) ;
+  [`handle_connection`](../crates/sytog-node/src/lib.rs#L350-L430) ;
 - détection d’un trou et nouvelle demande dans
-  [`connect_client`](../crates/sytog-node/src/lib.rs#L205-L233).
+  [`connect_client`](../crates/sytog-node/src/lib.rs#L257-L285).
 
 **Comportement en cas de violation.** Un trou visible provoque une nouvelle
 demande depuis la révision locale. Il n’existe ni timeout de convergence, ni
@@ -469,17 +504,19 @@ bornes explicites et un comportement de surcharge documenté.
 **État actuel, hypothèses et périmètre.** Le canal broadcast est borné à 256
 lots, mais le journal canonique reste intégralement dans un `Vec`. Chaque
 `events_after` filtre et clone tout le suffixe demandé dans un nouveau `Vec`.
-Un récepteur en retard retombe sur ce même rattrapage complet. Il n’existe ni
-pagination, fenêtre maximale, compaction, quota ni refus de surcharge.
+L’historique d’identité du client V1 conserve également tous les événements
+reçus après sa révision de base. Un récepteur en retard retombe sur ce même
+rattrapage complet. Il n’existe ni pagination, fenêtre maximale, compaction,
+quota ni refus de surcharge.
 
 **Point d’application actuel.**
 
 - capacité du canal dans
-  [`Host::load_or_create`](../crates/sytog-node/src/lib.rs#L431-L438) ;
+  [`Host::load_or_create`](../crates/sytog-node/src/lib.rs#L513-L524) ;
 - récupération après `Lagged` dans
-  [`handle_connection`](../crates/sytog-node/src/lib.rs#L366-L377) ;
+  [`handle_connection`](../crates/sytog-node/src/lib.rs#L440-L451) ;
 - clone non borné du suffixe dans
-  [`Host::events_after`](../crates/sytog-node/src/lib.rs#L560-L569).
+  [`Host::events_after`](../crates/sytog-node/src/lib.rs#L699-L708).
 
 **Comportement actuel sous pression.** Le journal mémoire croît avec la session.
 Un catch-up ancien alloue proportionnellement au suffixe. Un client lent peut
